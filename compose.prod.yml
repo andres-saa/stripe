@@ -12,7 +12,7 @@ services:
     ports: [ '80:80', '443:443' ]
     volumes:
       - ./nginx/conf.d:/etc/nginx/conf.d:rw
-      - ./nginx/proxy_params:/etc/nginx/proxy_params:ro
+      - ./nginx/proxy_params.conf:/etc/nginx/proxy_params.conf:ro
       - ./nginx/certbot/www:/var/www/certbot:ro
       - ./nginx/letsencrypt:/etc/letsencrypt:ro
     depends_on: [api_stripe]
