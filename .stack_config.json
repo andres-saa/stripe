@@ -1,0 +1,10 @@
+{
+  "project": "stripe",
+  "domain": "salchimonster.com",
+  "email": "andrew19f@gmail.com",
+  "staging": false,
+  "backs": [
+    "stripe"
+  ],
+  "fronts": []
+}

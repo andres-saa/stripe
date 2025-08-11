@@ -1,0 +1,24 @@
+version: '3.9'
+services:
+  api_stripe:
+    build: { context: ./backend/stripe, target: dev }
+    container_name: api_stripe
+    env_file: ./backend/stripe/.env
+    volumes:
+      - ./backend/stripe/app:/code
+    environment:
+      CHOKIDAR_USEPOLLING: "true"
+    ports:
+      - '8000:80'
+    restart: unless-stopped
+
+  proxy:
+    image: nginx:1.27-alpine
+    container_name: stripe_proxy_dev
+    ports: [ '80:80' ]
+    volumes:
+      - ./nginx_dev/conf.d:/etc/nginx/conf.d:ro
+      - ./nginx_dev/proxy_params:/etc/nginx/proxy_params:ro
+    depends_on: [api_stripe]
+    restart: unless-stopped
+
