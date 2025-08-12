@@ -1,8 +1,24 @@
+# main.py
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from routes import payments
-app=FastAPI()
+import os
+
+app = FastAPI(title="Stripe Payments API")
+
+# CORS (ajusta tus orígenes del front)
+ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*").split(",")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Rutas
 app.include_router(payments.router)
 
-@app.get('/')
-def hi():
-    return {'msg':'stripe'}
+@app.get("/")
+def root():
+    return {"ok": True}
