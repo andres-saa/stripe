@@ -14,7 +14,7 @@ services:
 
   proxy:
     image: nginx:1.27-alpine
-    container_name: stripe2_proxy_dev
+    container_name: stripe3_proxy_dev
     ports: [ '80:80' ]
     volumes:
       - ./nginx_dev/conf.d:/etc/nginx/conf.d:ro

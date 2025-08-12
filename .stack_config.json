@@ -1,7 +1,7 @@
 {
-  "project": "stripe2",
+  "project": "stripe3",
   "domain": "salchimonster.com",
-  "email": "andrew19f@gmail.com",
+  "email": "andrew19f@gmail.comm",
   "staging": false,
   "backs": [
     "stripe"

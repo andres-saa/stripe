@@ -1,7 +1,6 @@
 
 server {
-    listen 443 ssl;
-    http2;
+    listen 443 ssl http2;
     server_name api.stripe.salchimonster.com;
 
     ssl_certificate /etc/letsencrypt/live/api.stripe.salchimonster.com/fullchain.pem;
