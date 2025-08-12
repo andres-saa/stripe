@@ -3,5 +3,3 @@ uvicorn
 psycopg2-binary
 python-jose
 passlib[bcrypt]
-stripe 
-python-dotenv
