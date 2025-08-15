@@ -63,6 +63,9 @@ def stripe_config():
         # No es crítico para el flujo de cobro
         return {"server_mode": server_mode_from_secret(os.getenv("STRIPE_SECRET_KEY")), "error": str(e)}
 
+
+        
+
 @router.post("/create-payment-intent")
 def create_payment_intent(body: CreatePaymentIntent):
     """
@@ -103,6 +106,9 @@ def create_payment_intent(body: CreatePaymentIntent):
     except Exception as e:
         logger.exception("Unexpected error creating PaymentIntent")
         raise HTTPException(status_code=500, detail="Error creando el PaymentIntent")
+
+
+
 
 @router.post("/webhook")
 async def stripe_webhook(request: Request):
