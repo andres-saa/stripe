@@ -33,7 +33,7 @@ class MerchantCreds:
 DEFAULT_SALCHI_BACKEND_BASE = os.getenv("SALCHI_BACKEND_BASE", "https://backend.salchimonster.com")
 
 def _normalize(s: str | None) -> str:
-    return (s or "default").strip().lower()
+    return (s or "").strip().lower()
 
 def _load_merchants_from_env() -> Dict[str, MerchantCreds]:
     """
@@ -43,17 +43,17 @@ def _load_merchants_from_env() -> Dict[str, MerchantCreds]:
     Para cada sede X:
       STRIPE_X_SECRET_KEY
       STRIPE_X_WEBHOOK_SECRET
-      STRIPE_X_PUBLISHABLE_KEY
-      SALCHI_X_SECRET
-      SALCHI_X_BACKEND_BASE
+      STRIPE_X_PUBLISHABLE_KEY      (opcional)
+      SALCHI_X_SECRET               (opcional; fallback EPAYCO_SALCHI_SECRET_KEY)
+      SALCHI_X_BACKEND_BASE         (opcional; fallback DEFAULT_SALCHI_BACKEND_BASE)
 
-    Además crea 'default' desde variables sin sufijo como respaldo.
+    ⚠️ No se crea 'default'. Si no llega site/merchant válido => 400.
     """
     result: Dict[str, MerchantCreds] = {}
 
-    # 1) Por sedes explícitas
     sites_raw = os.getenv("STRIPE_SITES", "")
     sites = [i.strip() for i in sites_raw.split(",") if i.strip()]
+
     for site in sites:
         ssk = os.getenv(f"STRIPE_{site}_SECRET_KEY", "")
         whs = os.getenv(f"STRIPE_{site}_WEBHOOK_SECRET") or os.getenv(f"WEBHOOK_{site}_SECRET")
@@ -69,16 +69,6 @@ def _load_merchants_from_env() -> Dict[str, MerchantCreds]:
             publishable_key=pk,
         )
 
-    # 2) Respaldo 'default' (sin sufijo)
-    if "default" not in result:
-        result["default"] = MerchantCreds(
-            stripe_secret_key=os.getenv("STRIPE_SECRET_KEY", ""),
-            webhook_secret=os.getenv("STRIPE_WEBHOOK_SECRET") or os.getenv("WEBHOOK_SECRET"),
-            salchi_secret=os.getenv("SALCHI_SECRET") or os.getenv("EPAYCO_SALCHI_SECRET_KEY"),
-            salchi_backend_base=os.getenv("SALCHI_BACKEND_BASE", DEFAULT_SALCHI_BACKEND_BASE),
-            publishable_key=os.getenv("STRIPE_PUBLISHABLE_KEY"),
-        )
-
     return result
 
 MERCHANTS: Dict[str, MerchantCreds] = _load_merchants_from_env()
@@ -87,7 +77,11 @@ def get_creds_or_400(merchant: str) -> MerchantCreds:
     t = _normalize(merchant)
     creds = MERCHANTS.get(t)
     if not creds:
-        raise HTTPException(status_code=400, detail=f"Merchant/Site desconocido: {t}")
+        sitios = ", ".join(sorted(MERCHANTS.keys())) or "(vacío)"
+        raise HTTPException(
+            status_code=400,
+            detail=f"Merchant/Site desconocido: {t}. Válidos: {sitios}"
+        )
     return creds
 
 def resolve_merchant(
@@ -96,30 +90,47 @@ def resolve_merchant(
     site_q: Optional[str] = Query(default=None, alias="site"),
 ) -> str:
     """
-    Prioridad para identificar la SEDE/TENANT:
-    1) Header: X-Site, X-Site-Id, X-Merchant, X-Tenant
-    2) Query: ?site= o ?merchant=
-    3) 'default'
+    Identifica la SEDE/TENANT. Ahora es OBLIGATORIO.
+    Acepta:
+      Headers: X-Site | X-Site-Id | X-Merchant | X-Tenant
+      Query:   ?site=   | ?merchant=
+    Si no llega o no existe en MERCHANTS => 400.
     """
-    # Headers
+    # 1) Headers
     for hk in ("x-site", "x-site-id", "x-merchant", "x-tenant"):
         hv = request.headers.get(hk)
         if hv and hv.strip():
-            return _normalize(hv)
+            t = _normalize(hv)
+            if t not in MERCHANTS:
+                sitios = ", ".join(sorted(MERCHANTS.keys())) or "(vacío)"
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Merchant/Site desconocido: {t}. Debe enviar un site_id válido. Válidos: {sitios}"
+                )
+            return t
 
-    # Query
-    if site_q and site_q.strip():
-        return _normalize(site_q)
-    if merchant_q and merchant_q.strip():
-        return _normalize(merchant_q)
+    # 2) Query
+    for v in (site_q, merchant_q):
+        if v and v.strip():
+            t = _normalize(v)
+            if t not in MERCHANTS:
+                sitios = ", ".join(sorted(MERCHANTS.keys())) or "(vacío)"
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Merchant/Site desconocido: {t}. Debe enviar un site_id válido. Válidos: {sitios}"
+                )
+            return t
 
-    # Default
-    return "default"
+    # 3) Nada => 400 (sin default)
+    raise HTTPException(
+        status_code=400,
+        detail="site_id/merchant es obligatorio. Envíe X-Site|X-Site-Id|X-Merchant|X-Tenant o ?site=|?merchant=."
+    )
 
 def server_mode_from_secret(sk: str | None) -> str:
     if not sk:
         return "unknown"
-    return "live" if sk.startswith("sk_live_") else "test"
+    return "live" if str(sk).startswith("sk_live_") else "test"
 
 # ─────────────────────────────────────────
 # Helpers (DB / dominio)
@@ -154,12 +165,7 @@ def mark_order_failed(order_id: str, pi_id: str | None, reason: str, merchant: s
 # Endpoints
 # ─────────────────────────────────────────
 @router.get("/stripe/config")
-def stripe_config(merchant: str = Depends(resolve_merchant), request: Request = None):
-    """
-    Devuelve info de la cuenta según la sede/merchant elegida por header/query.
-    Headers soportados: X-Site | X-Site-Id | X-Merchant | X-Tenant
-    Query soportadas: ?site= | ?merchant=
-    """
+def stripe_config(merchant: str = Depends(resolve_merchant)):
     creds = get_creds_or_400(merchant)
     try:
         if not creds.stripe_secret_key:
@@ -171,15 +177,17 @@ def stripe_config(merchant: str = Depends(resolve_merchant), request: Request = 
             "server_mode": server_mode_from_secret(creds.stripe_secret_key),
             "account_id": acct.get("id"),
             "livemode": acct.get("charges_enabled", False) and acct.get("details_submitted", False),
-            "publishableKey": creds.publishable_key,  # útil para frontend por sede
+            "publishableKey": creds.publishable_key,
         }
+    except HTTPException:
+        raise
     except Exception as e:
         logger.exception(f"[{merchant}] Error retrieving Stripe account info")
         return {
             "merchant": merchant,
             "server_mode": server_mode_from_secret(creds.stripe_secret_key),
             "error": str(e),
-            "publishableKey": creds.publishable_key,  # lo devolvemos aunque falle Stripe
+            "publishableKey": creds.publishable_key,
         }
 
 @router.post("/create-payment-intent")
@@ -211,6 +219,7 @@ def create_payment_intent(
         order_id = str(metadata.get("order_id") or "")
         request_opts: Dict[str, Any] = {}
         if order_id:
+            # Stripe Python permite pasar idempotency_key como kwarg top-level.
             request_opts["idempotency_key"] = f"pi:order:{merchant}:{order_id}:{currency}:{body.amount}"
 
         intent = stripe.PaymentIntent.create(
