@@ -5,6 +5,7 @@ import os, math, asyncio, uuid
 import httpx
 from dotenv import load_dotenv
 import re
+
 load_dotenv()
 
 GOOGLE_API_KEY = os.getenv("GOOGLE_MAPS_API_KEY")
@@ -12,10 +13,11 @@ if not GOOGLE_API_KEY:
     print("⚠️  Falta GOOGLE_MAPS_API_KEY en el entorno (.env)")
 
 PLACES_AUTOCOMPLETE_URL = "https://maps.googleapis.com/maps/api/place/autocomplete/json"
-PLACES_DETAILS_URL = "https://maps.googleapis.com/maps/api/place/details/json"
-GEOCODE_URL = "https://maps.googleapis.com/maps/api/geocode/json"
-DELIVERY_RATE_USD_PER_MILE = float(os.getenv("DELIVERY_RATE_USD_PER_MILE", "1.5"))
+PLACES_DETAILS_URL      = "https://maps.googleapis.com/maps/api/place/details/json"
+GEOCODE_URL             = "https://maps.googleapis.com/maps/api/geocode/json"
+DISTANCE_MATRIX_URL     = "https://maps.googleapis.com/maps/api/distancematrix/json"
 
+DELIVERY_RATE_USD_PER_MILE = float(os.getenv("DELIVERY_RATE_USD_PER_MILE", "1.5"))
 
 router = APIRouter()
 
@@ -44,9 +46,6 @@ SEDES: List[Dict[str, Any]] = [
     },
 ]
 
-
-
-
 PLACES_COUNTRIES = os.getenv("PLACES_COUNTRIES", "us")  # p.ej. "us" o "us|pr"
 
 def _components_for(countries: Optional[str] = None) -> Optional[str]:
@@ -57,7 +56,6 @@ def _components_for(countries: Optional[str] = None) -> Optional[str]:
     countries = countries or PLACES_COUNTRIES  # p.ej. 'us'
     raw = [t.strip().lower() for t in re.split(r"[,\| ]+", countries) if t.strip()]
 
-    # Normalizaciones comunes
     alias = {
         "usa": "us", "u.s.a.": "us", "u.s.": "us", "eeuu": "us",
         "estados-unidos": "us", "estadosunidos": "us",
@@ -70,7 +68,6 @@ def _components_for(countries: Optional[str] = None) -> Optional[str]:
         if re.fullmatch(r"[a-z]{2}", t):  # solo alpha-2
             norm.append(t)
 
-    # dedup preservando orden
     norm = list(dict.fromkeys(norm))
     if not norm:
         return None
@@ -100,16 +97,16 @@ class DistanceResponse(BaseModel):
 
 class NearestInfo(BaseModel):
     site: Dict[str, Any]
-    distance_miles: float
+    distance_miles: float              # Haversine (rápida)
     in_coverage: bool
+    driving_distance_miles: Optional[float] = None  # por carretera (Distance Matrix)
 
 class AutocompleteItem(BaseModel):
     description: str
     place_id: str
     types: List[str] = []
-    nearest: Optional[NearestInfo] = None  # sede más cercana + bandera de cobertura
-    delivery_cost_usd: Optional[float] = None  # <--- NUEVO
-
+    nearest: Optional[NearestInfo] = None   # sede más cercana + bandera de cobertura
+    delivery_cost_usd: Optional[float] = None  # costo calculado (por carretera)
 
 class CoverageError(BaseModel):
     code: str
@@ -120,7 +117,7 @@ class CoverageError(BaseModel):
 class AutocompleteResponse(BaseModel):
     predictions: List[AutocompleteItem]
     session_token: str
-    error: Optional[CoverageError] = None  # <-- NUEVO: error solo si ninguna está en cobertura
+    error: Optional[CoverageError] = None  # error solo si ninguna está en cobertura
 
 # ─────────── Utilidades ───────────
 
@@ -139,12 +136,12 @@ def nearest_site_for(lat: float, lng: float, radius_miles: float = 8.0) -> Neare
     best_dist = float("inf")
     for s in SEDES:
         slat = s["location"]["lat"]
-        slng = s["location"]["long"]  # OJO: clave 'long' en tu JSON
+        slng = s["location"]["long"]  # clave 'long' en tu JSON
         d = haversine_miles(lat, lng, slat, slng)
         if d < best_dist:
             best_dist = d
             best = s
-    return NearestInfo(site=best, distance_miles=round(best_dist,2), in_coverage=(best_dist <= radius_miles))
+    return NearestInfo(site=best, distance_miles=round(best_dist, 2), in_coverage=(best_dist <= radius_miles))
 
 def make_out_of_coverage_error(radius_miles: float) -> CoverageError:
     return CoverageError(
@@ -157,7 +154,7 @@ def make_out_of_coverage_error(radius_miles: float) -> CoverageError:
 async def geocode_address(client: httpx.AsyncClient, address: str) -> Tuple[float, float, str]:
     if not GOOGLE_API_KEY:
         raise HTTPException(status_code=500, detail="No se configuró GOOGLE_MAPS_API_KEY")
-    params = {"address": address, "key": GOOGLE_API_KEY, "components": _components_for()},  # usa PLACES_COUNTRIES ("us") por defecto}
+    params = {"address": address, "key": GOOGLE_API_KEY, "components": _components_for()}
     resp = await client.get(GEOCODE_URL, params=params, timeout=20.0)
     if resp.status_code != 200:
         raise HTTPException(status_code=502, detail=f"Error geocodificando '{address}': HTTP {resp.status_code}")
@@ -198,14 +195,52 @@ async def places_details(
     formatted = res.get("formatted_address", "")
     return float(loc["lat"]), float(loc["lng"]), formatted or place_id
 
+async def driving_distance_miles(
+    client: httpx.AsyncClient,
+    o_lat: float, o_lng: float,
+    d_lat: float, d_lng: float,
+    language: str = "es"
+) -> Tuple[float, int]:
+    """
+    Devuelve (millas_por_carretera, duracion_segundos) usando Google Distance Matrix.
+    """
+    if not GOOGLE_API_KEY:
+        raise HTTPException(status_code=500, detail="No se configuró GOOGLE_MAPS_API_KEY")
+
+    params = {
+        "origins": f"{o_lat},{o_lng}",
+        "destinations": f"{d_lat},{d_lng}",
+        "mode": "driving",
+        "units": "imperial",   # 'text' será en millas; 'value' viene en metros
+        "language": language,
+        "key": GOOGLE_API_KEY,
+        # opcional: "departure_time": "now", "traffic_model": "best_guess"
+    }
+    resp = await client.get(DISTANCE_MATRIX_URL, params=params, timeout=20.0)
+    if resp.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"Distance Matrix HTTP {resp.status_code}")
+
+    data = resp.json()
+    if data.get("status") != "OK":
+        raise HTTPException(status_code=400, detail=f"Distance Matrix: {data.get('status')}")
+
+    el = (data.get("rows") or [{}])[0].get("elements") or [{}]
+    el = el[0]
+    if el.get("status") != "OK":
+        raise HTTPException(status_code=400, detail=f"Distance Matrix element: {el.get('status')}")
+
+    meters  = el["distance"]["value"]
+    seconds = el["duration"]["value"]
+    miles   = meters / 1609.344
+    return float(miles), int(seconds)
+
 # ─────────── Endpoints ───────────
+
 @router.get("/places/autocomplete", response_model=AutocompleteResponse)
 async def places_autocomplete(
     input: str = Query(..., min_length=1, description="Texto parcial de dirección"),
     session_token: Optional[str] = Query(None, description="Token de sesión para mejor facturación/resultados"),
     language: str = Query("es", description="Idioma de resultados"),
-    # ⚠️ 'region' NO es parámetro de Autocomplete. La dejamos por compatibilidad,
-    # pero la convertimos en un 'country' más dentro de components.
     region: Optional[str] = Query(None, description="Código de país ISO-3166-1 alpha-2 (deprecated)"),
     limit: int = Query(5, ge=1, le=10, description="Máximo de sugerencias"),
     coverage_radius_miles: float = Query(8.0, gt=0, description="Radio de cobertura en millas"),
@@ -214,36 +249,26 @@ async def places_autocomplete(
     """
     Devuelve SIEMPRE las predicciones de Google, con `nearest`.
     Si ninguna cae en cobertura, incluye `error` (200 OK).
+    Calcula el costo usando distancia por carretera (Distance Matrix) y mínimo = DELIVERY_RATE_USD_PER_MILE.
     """
     if not GOOGLE_API_KEY:
         raise HTTPException(status_code=500, detail="No se configuró GOOGLE_MAPS_API_KEY")
 
     stoken = session_token or str(uuid.uuid4())
 
-    # Construir components de manera robusta
+    # components
     comps = _components_for(countries)
-    # fusionar 'region' si llega
     if region:
         reg = _components_for(region)
         comps = f"{comps}|{reg}" if (comps and reg) else (reg or comps)
 
-    if SEDES:
-        CENTER_LAT = sum(s["location"]["lat"] for s in SEDES) / len(SEDES)
-        CENTER_LNG = sum(s["location"]["long"] for s in SEDES) / len(SEDES)  # ojo: clave 'long' en tu JSON
-    else:
-        CENTER_LAT = 0.0
-        CENTER_LNG = 0.0
-
     params = {
-    "input": input,
-    "key": GOOGLE_API_KEY,
-    "language": language,
-    "sessiontoken": stoken,
-    "types": "address",
+        "input": input,
+        "key": GOOGLE_API_KEY,
+        "language": language,
+        "sessiontoken": stoken,
+        "types": "address",
     }
-
-
-
     if comps:
         params["components"] = comps
 
@@ -272,12 +297,14 @@ async def places_autocomplete(
             for p in raw_preds
         ]
 
-        # Resolver coordenadas para nearest
-        async with httpx.AsyncClient() as client2:
-            tasks = [places_details(client2, it.place_id, stoken) for it in items]
-            results = await asyncio.gather(*tasks, return_exceptions=True)
+    # Resolver coordenadas + nearest + Driving Matrix en un solo cliente
+    async with httpx.AsyncClient() as client2:
+        # 1) Details (en paralelo)
+        tasks_details = [places_details(client2, it.place_id, stoken) for it in items]
+        results_details = await asyncio.gather(*tasks_details, return_exceptions=True)
 
-        for it, res in zip(items, results):
+        # 2) Calcular nearest por Haversine (rápido)
+        for it, res in zip(items, results_details):
             if isinstance(res, Exception):
                 continue
             plat, plng, _formatted = res
@@ -286,33 +313,57 @@ async def places_autocomplete(
         any_in_coverage = any(it.nearest and it.nearest.in_coverage for it in items)
 
         if not any_in_coverage and items:
+            # No calculamos precio si no hay cobertura
             return AutocompleteResponse(
                 predictions=items,
                 session_token=stoken,
                 error=make_out_of_coverage_error(coverage_radius_miles),
             )
 
-        for it, res in zip(items, results):
-            if isinstance(res, Exception):
+        # 3) Calcular distancia de manejo y precio SOLO para los que están en cobertura (en paralelo)
+        driving_tasks = []
+        driving_indices = []
+        for idx, (it, res) in enumerate(zip(items, results_details)):
+            if isinstance(res, Exception) or not it.nearest or not it.nearest.in_coverage:
                 continue
             plat, plng, _formatted = res
-            it.nearest = nearest_site_for(plat, plng, radius_miles=coverage_radius_miles)
+            s = it.nearest.site["location"]
+            driving_tasks.append(
+                driving_distance_miles(
+                    client2,
+                    s["lat"], s["long"],
+                    plat, plng,
+                    language=language
+                )
+            )
+            driving_indices.append(idx)
 
-            # Asignar costo solo si está en cobertura
-            if it.nearest and it.nearest.in_coverage:
-                it.delivery_cost_usd = math.ceil(
-                    max(
-                        round(it.nearest.distance_miles * DELIVERY_RATE_USD_PER_MILE, 2),
-                        DELIVERY_RATE_USD_PER_MILE
-                )
-                )
-            else:
+        driving_results = await asyncio.gather(*driving_tasks, return_exceptions=True)
+
+        # 4) Volcar resultados de precio
+        for idx, dres in zip(driving_indices, driving_results):
+            it = items[idx]
+            if isinstance(dres, Exception):
+                # Fallback: precio con Haversine si falla Distance Matrix
+                d_miles = it.nearest.distance_miles if it.nearest else None
+                if d_miles is not None:
+                    it.delivery_cost_usd = math.ceil(
+                        max(round(d_miles * DELIVERY_RATE_USD_PER_MILE, 2), DELIVERY_RATE_USD_PER_MILE)
+                    )
+                continue
+
+            d_miles, _secs = dres
+            it.nearest.driving_distance_miles = round(d_miles, 2)
+            it.delivery_cost_usd = math.ceil(
+                max(round(d_miles * DELIVERY_RATE_USD_PER_MILE, 2), DELIVERY_RATE_USD_PER_MILE)
+            )
+
+        # Los que no tienen cobertura: sin costo
+        for it in items:
+            if not it.nearest or not it.nearest.in_coverage:
                 it.delivery_cost_usd = None
 
-                
-
-        return AutocompleteResponse(predictions=items, session_token=stoken)
-
+    return AutocompleteResponse(predictions=items, session_token=stoken)
 
 @router.get("/places/details", response_model=GeocodedPoint)
 async def places_details_endpoint(
@@ -324,9 +375,12 @@ async def places_details_endpoint(
     return GeocodedPoint(query=place_id, formatted_address=formatted, lat=lat, lng=lng)
 
 @router.post("/distance", response_model=DistanceResponse)
-async def compute_distance(body: DistanceRequest):
+async def compute_distance(
+    body: DistanceRequest,
+    method: str = Query("driving", pattern=r"^(haversine|driving)$")
+):
+    # Resolver origen/destino
     async with httpx.AsyncClient() as client:
-        # Origen
         if body.origin_place_id:
             olat, olng, ofmt = await places_details(client, body.origin_place_id, body.session_token)
             oquery = body.origin_place_id
@@ -336,7 +390,6 @@ async def compute_distance(body: DistanceRequest):
         else:
             raise HTTPException(status_code=422, detail="Debes enviar origin o origin_place_id")
 
-        # Destino
         if body.destination_place_id:
             dlat, dlng, dfmt = await places_details(client, body.destination_place_id, body.session_token)
             dquery = body.destination_place_id
@@ -346,8 +399,16 @@ async def compute_distance(body: DistanceRequest):
         else:
             raise HTTPException(status_code=422, detail="Debes enviar destination o destination_place_id")
 
-    miles = haversine_miles(olat, olng, dlat, dlng)
-    km = miles * 1.609344
+    # Calcular distancia según método
+    if method == "driving":
+        async with httpx.AsyncClient() as client:
+            miles, _secs = await driving_distance_miles(client, olat, olng, dlat, dlng)
+        km = miles * 1.609344
+        used_method = "google_distance_matrix_driving"
+    else:
+        miles = haversine_miles(olat, olng, dlat, dlng)
+        km = miles * 1.609344
+        used_method = "great_circle_haversine"
 
     origin_gc = GeocodedPoint(query=oquery, formatted_address=ofmt, lat=olat, lng=olng)
     destination_gc = GeocodedPoint(query=dquery, formatted_address=dfmt, lat=dlat, lng=dlng)
@@ -357,4 +418,5 @@ async def compute_distance(body: DistanceRequest):
         destination=destination_gc,
         distance_miles=round(miles, 2),
         distance_km=round(km, 2),
+        method=used_method,
     )
