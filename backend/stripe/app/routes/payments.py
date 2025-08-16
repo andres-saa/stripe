@@ -35,6 +35,28 @@ DEFAULT_SALCHI_BACKEND_BASE = os.getenv("SALCHI_BACKEND_BASE", "https://backend.
 def _normalize(s: str | None) -> str:
     return (s or "").strip().lower()
 
+def _getenv_strip(name: str) -> str:
+    return (os.getenv(name) or "").strip()
+
+def _validate_whsec(s: str | None) -> Optional[str]:
+    """Limpia 'whsec' mal pegados (duplicados) y espacios."""
+    if not s:
+        return None
+    s = s.strip()
+    # Corrige casos como "...whsec_ABC...whsec_DEF..." tomando la última
+    if s.count("whsec_") > 1:
+        s = "whsec_" + s.split("whsec_")[-1]
+    return s
+
+def _mask(s: str | None) -> str:
+    """Para /healthz: pista no sensible del secret."""
+    if not s:
+        return ""
+    s = s.strip()
+    if len(s) <= 10:
+        return "…" * len(s)
+    return f"{s[:6]}…{s[-4:]}"
+
 def _load_merchants_from_env() -> Dict[str, MerchantCreds]:
     """
     Carga credenciales POR SEDE usando:
@@ -51,15 +73,15 @@ def _load_merchants_from_env() -> Dict[str, MerchantCreds]:
     """
     result: Dict[str, MerchantCreds] = {}
 
-    sites_raw = os.getenv("STRIPE_SITES", "")
+    sites_raw = _getenv_strip("STRIPE_SITES")
     sites = [i.strip() for i in sites_raw.split(",") if i.strip()]
 
     for site in sites:
-        ssk = os.getenv(f"STRIPE_{site}_SECRET_KEY", "")
-        whs = os.getenv(f"STRIPE_{site}_WEBHOOK_SECRET") or os.getenv(f"WEBHOOK_{site}_SECRET")
-        salchi = os.getenv(f"SALCHI_{site}_SECRET") or os.getenv("EPAYCO_SALCHI_SECRET_KEY")
-        base = os.getenv(f"SALCHI_{site}_BACKEND_BASE") or DEFAULT_SALCHI_BACKEND_BASE
-        pk = os.getenv(f"STRIPE_{site}_PUBLISHABLE_KEY") or os.getenv("STRIPE_PUBLISHABLE_KEY")
+        ssk = _getenv_strip(f"STRIPE_{site}_SECRET_KEY")
+        whs = _validate_whsec(_getenv_strip(f"STRIPE_{site}_WEBHOOK_SECRET") or _getenv_strip(f"WEBHOOK_{site}_SECRET"))
+        salchi = _getenv_strip(f"SALCHI_{site}_SECRET") or _getenv_strip("EPAYCO_SALCHI_SECRET_KEY")
+        base = _getenv_strip(f"SALCHI_{site}_BACKEND_BASE") or DEFAULT_SALCHI_BACKEND_BASE
+        pk = _getenv_strip(f"STRIPE_{site}_PUBLISHABLE_KEY") or _getenv_strip("STRIPE_PUBLISHABLE_KEY")
 
         result[_normalize(site)] = MerchantCreds(
             stripe_secret_key=ssk,
@@ -268,7 +290,10 @@ async def stripe_webhook(
 
     try:
         event = stripe.Webhook.construct_event(
-            payload=payload, sig_header=sig_header, secret=creds.webhook_secret
+            payload=payload,
+            sig_header=sig_header,
+            secret=creds.webhook_secret,
+            tolerance=300,  # 5 minutos de tolerancia por si hay ligero desfase de reloj
         )
     except stripe.error.SignatureVerificationError:
         raise HTTPException(status_code=400, detail="Firma inválida")
@@ -314,7 +339,7 @@ async def stripe_webhook(
 
 @router.get("/healthz")
 def healthz():
-    # Devuelve listado de merchants/sedes cargados y banderas útiles
+    # Devuelve listado de merchants/sedes cargados y banderas útiles (+ pista del webhook secret)
     return {
         "status": "ok",
         "merchants": [
@@ -323,6 +348,7 @@ def healthz():
                 "server_mode": server_mode_from_secret(c.stripe_secret_key),
                 "has_publishable_key": bool(c.publishable_key),
                 "has_webhook_secret": bool(c.webhook_secret),
+                "webhook_secret_hint": _mask(c.webhook_secret),
             }
             for m, c in MERCHANTS.items()
         ],
