@@ -20,99 +20,99 @@ class CreatePaymentIntent(BaseModel):
     metadata: dict | None = None
 
 # ─────────────────────────────────────────
-# Multi-tenant: credenciales por merchant
+# Multi-tenant por SEDE (site_id)
 # ─────────────────────────────────────────
 @dataclass
 class MerchantCreds:
     stripe_secret_key: str
-    webhook_secret: Optional[str]  # para /webhook/{merchant}
+    webhook_secret: Optional[str]
     salchi_secret: Optional[str]
     salchi_backend_base: str
-    publishable_key: Optional[str]  # 👈 NUEVO
+    publishable_key: Optional[str]
 
 DEFAULT_SALCHI_BACKEND_BASE = os.getenv("SALCHI_BACKEND_BASE", "https://backend.salchimonster.com")
 
-def _normalize_tenant(s: str | None) -> str:
+def _normalize(s: str | None) -> str:
     return (s or "default").strip().lower()
 
 def _load_merchants_from_env() -> Dict[str, MerchantCreds]:
     """
-    Carga credenciales por sufijo: VAR__TENANT.
-    Ej:
-      STRIPE_SECRET_KEY__US, STRIPE_WEBHOOK_SECRET__US, SALCHI_SECRET__US,
-      SALCHI_BACKEND_BASE__US, STRIPE_PUBLISHABLE_KEY__US
-    Crea también el tenant 'default' desde las variables sin sufijo.
+    Carga credenciales POR SEDE usando:
+      STRIPE_SITES=33,35,36
+
+    Para cada sede X:
+      STRIPE_X_SECRET_KEY
+      STRIPE_X_WEBHOOK_SECRET
+      STRIPE_X_PUBLISHABLE_KEY
+      SALCHI_X_SECRET
+      SALCHI_X_BACKEND_BASE
+
+    Además crea 'default' desde variables sin sufijo como respaldo.
     """
-    buckets: Dict[str, Dict[str, str]] = {}
-
-    # 1) Variables con sufijo __TENANT
-    for k, v in os.environ.items():
-        if "__" in k:
-            base, tenant = k.split("__", 1)
-            t = _normalize_tenant(tenant)
-            buckets.setdefault(t, {})[base] = v
-
-    # 2) Variables "default" (sin sufijo)
-    buckets.setdefault("default", {})
-    default_keys = [
-        "STRIPE_SECRET_KEY",
-        "STRIPE_WEBHOOK_SECRET",
-        "WEBHOOK_SECRET",
-        "SALCHI_SECRET",
-        "EPAYCO_SALCHI_SECRET_KEY",
-        "SALCHI_BACKEND_BASE",
-        "STRIPE_PUBLISHABLE_KEY",  # 👈 NUEVO
-    ]
-    for base_key in default_keys:
-        val = os.getenv(base_key)
-        if val:
-            buckets["default"][base_key] = val  # type: ignore
-
-    # 3) Construir MerchantCreds
     result: Dict[str, MerchantCreds] = {}
-    for tenant, vals in buckets.items():
-        ssk = vals.get("STRIPE_SECRET_KEY")
-        whs = vals.get("STRIPE_WEBHOOK_SECRET") or vals.get("WEBHOOK_SECRET")
-        salchi = vals.get("SALCHI_SECRET") or vals.get("EPAYCO_SALCHI_SECRET_KEY")
-        base = vals.get("SALCHI_BACKEND_BASE", DEFAULT_SALCHI_BACKEND_BASE)
-        pk = vals.get("STRIPE_PUBLISHABLE_KEY")  # 👈 NUEVO
 
-        result[tenant] = MerchantCreds(
-            stripe_secret_key=ssk or "",  # validaremos al usar
+    # 1) Por sedes explícitas
+    sites_raw = os.getenv("STRIPE_SITES", "")
+    sites = [i.strip() for i in sites_raw.split(",") if i.strip()]
+    for site in sites:
+        ssk = os.getenv(f"STRIPE_{site}_SECRET_KEY", "")
+        whs = os.getenv(f"STRIPE_{site}_WEBHOOK_SECRET") or os.getenv(f"WEBHOOK_{site}_SECRET")
+        salchi = os.getenv(f"SALCHI_{site}_SECRET") or os.getenv("EPAYCO_SALCHI_SECRET_KEY")
+        base = os.getenv(f"SALCHI_{site}_BACKEND_BASE") or DEFAULT_SALCHI_BACKEND_BASE
+        pk = os.getenv(f"STRIPE_{site}_PUBLISHABLE_KEY") or os.getenv("STRIPE_PUBLISHABLE_KEY")
+
+        result[_normalize(site)] = MerchantCreds(
+            stripe_secret_key=ssk,
             webhook_secret=whs,
             salchi_secret=salchi,
             salchi_backend_base=base,
-            publishable_key=pk,           # 👈 NUEVO
+            publishable_key=pk,
         )
+
+    # 2) Respaldo 'default' (sin sufijo)
+    if "default" not in result:
+        result["default"] = MerchantCreds(
+            stripe_secret_key=os.getenv("STRIPE_SECRET_KEY", ""),
+            webhook_secret=os.getenv("STRIPE_WEBHOOK_SECRET") or os.getenv("WEBHOOK_SECRET"),
+            salchi_secret=os.getenv("SALCHI_SECRET") or os.getenv("EPAYCO_SALCHI_SECRET_KEY"),
+            salchi_backend_base=os.getenv("SALCHI_BACKEND_BASE", DEFAULT_SALCHI_BACKEND_BASE),
+            publishable_key=os.getenv("STRIPE_PUBLISHABLE_KEY"),
+        )
+
     return result
 
 MERCHANTS: Dict[str, MerchantCreds] = _load_merchants_from_env()
 
 def get_creds_or_400(merchant: str) -> MerchantCreds:
-    t = _normalize_tenant(merchant)
+    t = _normalize(merchant)
     creds = MERCHANTS.get(t)
     if not creds:
-        raise HTTPException(status_code=400, detail=f"Merchant desconocido: {t}")
+        raise HTTPException(status_code=400, detail=f"Merchant/Site desconocido: {t}")
     return creds
 
 def resolve_merchant(
     request: Request,
-    merchant_q: Optional[str] = Query(default=None, alias="merchant")
+    merchant_q: Optional[str] = Query(default=None, alias="merchant"),
+    site_q: Optional[str] = Query(default=None, alias="site"),
 ) -> str:
     """
-    Prioridad:
-    1) Path param (cuando aplique)
-    2) Header: X-Merchant o X-Tenant
-    3) Query param: ?merchant=
-    4) 'default'
+    Prioridad para identificar la SEDE/TENANT:
+    1) Header: X-Site, X-Site-Id, X-Merchant, X-Tenant
+    2) Query: ?site= o ?merchant=
+    3) 'default'
     """
     # Headers
-    h = request.headers.get("x-merchant") or request.headers.get("x-tenant")
-    if h and h.strip():
-        return _normalize_tenant(h)
+    for hk in ("x-site", "x-site-id", "x-merchant", "x-tenant"):
+        hv = request.headers.get(hk)
+        if hv and hv.strip():
+            return _normalize(hv)
+
     # Query
+    if site_q and site_q.strip():
+        return _normalize(site_q)
     if merchant_q and merchant_q.strip():
-        return _normalize_tenant(merchant_q)
+        return _normalize(merchant_q)
+
     # Default
     return "default"
 
@@ -126,7 +126,7 @@ def server_mode_from_secret(sk: str | None) -> str:
 # ─────────────────────────────────────────
 async def mark_order_paid(order_id: str, pi_id: str, merchant: str):
     """
-    Llama a: {SALCHI_BACKEND_BASE}/pay-order/{order_id}/{ref}/{secret} (por merchant)
+    Llama a: {SALCHI_BACKEND_BASE}/pay-order/{order_id}/{ref}/{secret} (por merchant/sede)
     """
     creds = get_creds_or_400(merchant)
     if not creds.salchi_secret:
@@ -156,8 +156,9 @@ def mark_order_failed(order_id: str, pi_id: str | None, reason: str, merchant: s
 @router.get("/stripe/config")
 def stripe_config(merchant: str = Depends(resolve_merchant), request: Request = None):
     """
-    Devuelve info de la cuenta según el merchant elegido por header/query.
-    Header recomendado: X-Merchant: us|co|...
+    Devuelve info de la cuenta según la sede/merchant elegida por header/query.
+    Headers soportados: X-Site | X-Site-Id | X-Merchant | X-Tenant
+    Query soportadas: ?site= | ?merchant=
     """
     creds = get_creds_or_400(merchant)
     try:
@@ -170,7 +171,7 @@ def stripe_config(merchant: str = Depends(resolve_merchant), request: Request = 
             "server_mode": server_mode_from_secret(creds.stripe_secret_key),
             "account_id": acct.get("id"),
             "livemode": acct.get("charges_enabled", False) and acct.get("details_submitted", False),
-            "publishableKey": creds.publishable_key,  # 👈 NUEVO (útil para frontend)
+            "publishableKey": creds.publishable_key,  # útil para frontend por sede
         }
     except Exception as e:
         logger.exception(f"[{merchant}] Error retrieving Stripe account info")
@@ -178,7 +179,7 @@ def stripe_config(merchant: str = Depends(resolve_merchant), request: Request = 
             "merchant": merchant,
             "server_mode": server_mode_from_secret(creds.stripe_secret_key),
             "error": str(e),
-            "publishableKey": creds.publishable_key,  # 👈 lo devolvemos aunque falle Stripe
+            "publishableKey": creds.publishable_key,  # lo devolvemos aunque falle Stripe
         }
 
 @router.post("/create-payment-intent")
@@ -188,9 +189,9 @@ def create_payment_intent(
     merchant: str = Depends(resolve_merchant),
 ):
     """
-    Crea el PaymentIntent con la API key del merchant.
-    También agrega merchant al metadata para trazabilidad (no para verificación).
-    Devuelve además la publishableKey correspondiente al merchant.
+    Crea el PaymentIntent con la API key de la SEDE (merchant).
+    Incluye el 'merchant' en metadata para auditoría.
+    Devuelve también la publishableKey correspondiente a esa sede.
     """
     creds = get_creds_or_400(merchant)
     try:
@@ -205,13 +206,11 @@ def create_payment_intent(
 
         currency = body.currency.lower()
         metadata = dict(body.metadata or {})
-        # Asegura que merchant viaje en el intent para auditoría
         metadata.setdefault("merchant", merchant)
 
         order_id = str(metadata.get("order_id") or "")
         request_opts: Dict[str, Any] = {}
         if order_id:
-            # Incluye merchant en idempotency_key para no cruzar tenants
             request_opts["idempotency_key"] = f"pi:order:{merchant}:{order_id}:{currency}:{body.amount}"
 
         intent = stripe.PaymentIntent.create(
@@ -219,8 +218,8 @@ def create_payment_intent(
             currency=currency,
             automatic_payment_methods={"enabled": True},
             metadata=metadata,
-            api_key=creds.stripe_secret_key,        # 👈 clave específica
-            **request_opts,                          # (request option idempotency_key)
+            api_key=creds.stripe_secret_key,
+            **request_opts,
         )
 
         return {
@@ -228,7 +227,7 @@ def create_payment_intent(
             "clientSecret": intent.client_secret,
             "intentId": intent.id,
             "livemode": bool(getattr(intent, "livemode", False)),
-            "publishableKey": creds.publishable_key,  # 👈 NUEVO
+            "publishableKey": creds.publishable_key,
         }
 
     except stripe.error.StripeError as e:
@@ -243,12 +242,12 @@ def create_payment_intent(
 @router.post("/webhook/{merchant}")
 async def stripe_webhook(
     request: Request,
-    merchant: str = Path(..., description="Identificador del comercio/tenant"),
+    merchant: str = Path(..., description="Identificador de la sede/merchant (site_id)"),
 ):
     """
-    Webhook por-merchant: verifica la firma con el secret del merchant sin confiar en el payload.
-    Configura en Stripe el endpoint apuntando a /webhook/{merchant} y usa el secret de ese endpoint
-    en la env var STRIPE_WEBHOOK_SECRET__{MERCHANT} (o WEBHOOK_SECRET__{MERCHANT}).
+    Webhook por sede: verifica la firma con el secret de ESA sede.
+    Configura en Stripe el endpoint apuntando a /webhook/{siteId}
+    y usa en el entorno STRIPE_{site}_WEBHOOK_SECRET.
     """
     creds = get_creds_or_400(merchant)
     payload = await request.body()
@@ -306,7 +305,7 @@ async def stripe_webhook(
 
 @router.get("/healthz")
 def healthz():
-    # Devuelve listado de merchants cargados y si tienen publishable key
+    # Devuelve listado de merchants/sedes cargados y banderas útiles
     return {
         "status": "ok",
         "merchants": [
