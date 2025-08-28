@@ -17,6 +17,13 @@ PLACES_DETAILS_URL      = "https://maps.googleapis.com/maps/api/place/details/js
 GEOCODE_URL             = "https://maps.googleapis.com/maps/api/geocode/json"
 DISTANCE_MATRIX_URL     = "https://maps.googleapis.com/maps/api/distancematrix/json"
 
+# Shipday (NUEVO)
+SHIPDAY_API_KEY = os.getenv("SHIPDAY_API_KEY")
+if not SHIPDAY_API_KEY:
+    print("⚠️  Falta SHIPDAY_API_KEY en el entorno (.env)")
+SHIPDAY_AVAILABILITY_URL = "https://api.shipday.com/on-demand/availability"
+
+# Solo se usa como fallback si Shipday no devuelve tarifa
 DELIVERY_RATE_USD_PER_MILE = float(os.getenv("DELIVERY_RATE_USD_PER_MILE", "1.5"))
 
 router = APIRouter()
@@ -106,7 +113,7 @@ class AutocompleteItem(BaseModel):
     place_id: str
     types: List[str] = []
     nearest: Optional[NearestInfo] = None   # sede más cercana + bandera de cobertura
-    delivery_cost_usd: Optional[float] = None  # costo calculado (por carretera)
+    delivery_cost_usd: Optional[float] = None  # AHORA: tarifa de Shipday (fallback a millas si falla)
 
 class CoverageError(BaseModel):
     code: str
@@ -155,7 +162,7 @@ async def geocode_address(client: httpx.AsyncClient, address: str) -> Tuple[floa
     if not GOOGLE_API_KEY:
         raise HTTPException(status_code=500, detail="No se configuró GOOGLE_MAPS_API_KEY")
     params = {"address": address, "key": GOOGLE_API_KEY, "components": _components_for()}
-    resp = await client.get(GEOCODE_URL, params=params, timeout=20.0)
+    resp = await client.get(GEOCODE_URL, params=params, timeout=1000.0)
     if resp.status_code != 200:
         raise HTTPException(status_code=502, detail=f"Error geocodificando '{address}': HTTP {resp.status_code}")
     data = resp.json()
@@ -182,7 +189,7 @@ async def places_details(
     }
     if session_token:
         params["sessiontoken"] = session_token
-    resp = await client.get(PLACES_DETAILS_URL, params=params, timeout=20.0)
+    resp = await client.get(PLACES_DETAILS_URL, params=params, timeout=1000.0)
     if resp.status_code != 200:
         raise HTTPException(status_code=502, detail=f"Error en Place Details: HTTP {resp.status_code}")
     data = resp.json()
@@ -216,7 +223,7 @@ async def driving_distance_miles(
         "key": GOOGLE_API_KEY,
         # opcional: "departure_time": "now", "traffic_model": "best_guess"
     }
-    resp = await client.get(DISTANCE_MATRIX_URL, params=params, timeout=20.0)
+    resp = await client.get(DISTANCE_MATRIX_URL, params=params, timeout=1000.0)
     if resp.status_code != 200:
         raise HTTPException(status_code=502, detail=f"Distance Matrix HTTP {resp.status_code}")
 
@@ -234,6 +241,59 @@ async def driving_distance_miles(
     miles   = meters / 1609.344
     return float(miles), int(seconds)
 
+# ─────────── SHIPDAY (NUEVO) ───────────
+
+async def shipday_quote_fee(
+    client: httpx.AsyncClient,
+    pickup_lat: float, pickup_lng: float,
+    drop_lat: float, drop_lng: float
+) -> Optional[float]:
+    """
+    Pide a Shipday disponibilidad/tarifa entre (pickup) y (drop).
+    Devuelve la tarifa mínima (fee) entre los servicios disponibles, o None si no hay tarifa.
+    NOTA: Asegúrate en tu cuenta de Shipday tener habilitado al menos un tercero (DoorDash, Uber, etc.)
+    """
+    headers = {
+        "Authorization": SHIPDAY_API_KEY,
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    payload = {
+        "pickupLatitude": pickup_lat,
+        "pickupLongitude": pickup_lng,
+        "dropoffLatitude": drop_lat,
+        "dropoffLongitude": drop_lng,
+    }
+    try:
+        resp = await client.post(SHIPDAY_AVAILABILITY_URL, headers=headers, json=payload, timeout=1000.0)
+    except Exception:
+        return None
+
+    if resp.status_code != 200:
+        # 400 típico: "no third party delivery service has been enabled by the user"
+        return None
+
+    try:
+        data = resp.json()
+    except Exception:
+        return None
+
+    if not isinstance(data, list):
+        return None
+
+    fees = []
+    for item in data:
+        if not item or item.get("error") is True:
+            continue
+        fee = item.get("fee")
+        if isinstance(fee, (int, float)):
+            fees.append(float(fee))
+
+    if not fees:
+        return None
+
+    return min(fees)
+
 # ─────────── Endpoints ───────────
 
 @router.get("/places/autocomplete", response_model=AutocompleteResponse)
@@ -249,7 +309,7 @@ async def places_autocomplete(
     """
     Devuelve SIEMPRE las predicciones de Google, con `nearest`.
     Si ninguna cae en cobertura, incluye `error` (200 OK).
-    Calcula el costo usando distancia por carretera (Distance Matrix) y mínimo = DELIVERY_RATE_USD_PER_MILE.
+    Calcula el costo consultando Shipday. Si Shipday no retorna tarifa, usa fallback por millas.
     """
     if not GOOGLE_API_KEY:
         raise HTTPException(status_code=500, detail="No se configuró GOOGLE_MAPS_API_KEY")
@@ -297,7 +357,7 @@ async def places_autocomplete(
             for p in raw_preds
         ]
 
-    # Resolver coordenadas + nearest + Driving Matrix en un solo cliente
+    # Resolver coordenadas + nearest + Driving Matrix + Shipday en un solo cliente
     async with httpx.AsyncClient() as client2:
         # 1) Details (en paralelo)
         tasks_details = [places_details(client2, it.place_id, stoken) for it in items]
@@ -320,14 +380,20 @@ async def places_autocomplete(
                 error=make_out_of_coverage_error(coverage_radius_miles),
             )
 
-        # 3) Calcular distancia de manejo y precio SOLO para los que están en cobertura (en paralelo)
+        # 3) Para los que están en cobertura: calcular distancia de manejo (Google) y pedir tarifa a Shipday (en paralelo)
         driving_tasks = []
+        shipday_tasks = []
         driving_indices = []
+        shipday_indices = []
+
         for idx, (it, res) in enumerate(zip(items, results_details)):
             if isinstance(res, Exception) or not it.nearest or not it.nearest.in_coverage:
                 continue
+
             plat, plng, _formatted = res
             s = it.nearest.site["location"]
+
+            # Google Distance Matrix (para mostrar driving_distance_miles)
             driving_tasks.append(
                 driving_distance_miles(
                     client2,
@@ -338,25 +404,40 @@ async def places_autocomplete(
             )
             driving_indices.append(idx)
 
-        driving_results = await asyncio.gather(*driving_tasks, return_exceptions=True)
+            # Shipday quote para el costo de entrega
+            shipday_tasks.append(
+                shipday_quote_fee(
+                    client2,
+                    pickup_lat=s["lat"], pickup_lng=s["long"],
+                    drop_lat=plat, drop_lng=plng
+                )
+            )
+            shipday_indices.append(idx)
 
-        # 4) Volcar resultados de precio
+        driving_results = await asyncio.gather(*driving_tasks, return_exceptions=True)
+        shipday_results = await asyncio.gather(*shipday_tasks, return_exceptions=True)
+
+        # 4) Volcar distancia por carretera
         for idx, dres in zip(driving_indices, driving_results):
             it = items[idx]
             if isinstance(dres, Exception):
-                # Fallback: precio con Haversine si falla Distance Matrix
-                d_miles = it.nearest.distance_miles if it.nearest else None
-                if d_miles is not None:
-                    it.delivery_cost_usd = math.ceil(
-                        max(round(d_miles * DELIVERY_RATE_USD_PER_MILE, 2), DELIVERY_RATE_USD_PER_MILE)
-                    )
+                # si falla Google, dejamos solo Haversine en nearest.distance_miles (ya calculado)
                 continue
-
             d_miles, _secs = dres
             it.nearest.driving_distance_miles = round(d_miles, 2)
-            it.delivery_cost_usd = math.ceil(
-                max(round(d_miles * DELIVERY_RATE_USD_PER_MILE, 2), DELIVERY_RATE_USD_PER_MILE)
-            )
+
+        # 5) Volcar costo desde Shipday (con fallback a millas si no hay tarifa)
+        for idx, sres in zip(shipday_indices, shipday_results):
+            it = items[idx]
+            fee = None if isinstance(sres, Exception) else sres
+            if isinstance(fee, (int, float)):
+                it.delivery_cost_usd = math.ceil(float(fee))
+            else:
+                # Fallback: precio con Haversine si falla Shipday
+                d_miles = it.nearest.driving_distance_miles or it.nearest.distance_miles
+                it.delivery_cost_usd = math.ceil(
+                    max(round(d_miles * DELIVERY_RATE_USD_PER_MILE, 2), DELIVERY_RATE_USD_PER_MILE)
+                )
 
         # Los que no tienen cobertura: sin costo
         for it in items:
