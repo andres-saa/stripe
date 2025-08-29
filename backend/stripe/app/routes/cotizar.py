@@ -17,13 +17,13 @@ PLACES_DETAILS_URL      = "https://maps.googleapis.com/maps/api/place/details/js
 GEOCODE_URL             = "https://maps.googleapis.com/maps/api/geocode/json"
 DISTANCE_MATRIX_URL     = "https://maps.googleapis.com/maps/api/distancematrix/json"
 
-# Shipday (NUEVO)
+# Shipday
 SHIPDAY_API_KEY = os.getenv("SHIPDAY_API_KEY")
 if not SHIPDAY_API_KEY:
     print("⚠️  Falta SHIPDAY_API_KEY en el entorno (.env)")
 SHIPDAY_AVAILABILITY_URL = "https://api.shipday.com/on-demand/availability"
 
-# Solo se usa como fallback si Shipday no devuelve tarifa
+# Fallback si Shipday no devuelve tarifa
 DELIVERY_RATE_USD_PER_MILE = float(os.getenv("DELIVERY_RATE_USD_PER_MILE", "1.5"))
 
 router = APIRouter()
@@ -60,7 +60,7 @@ def _components_for(countries: Optional[str] = None) -> Optional[str]:
     Convierte 'us|pr' o 'usa, puerto-rico' -> 'country:us|country:pr'
     Filtra y normaliza a ISO-3166-1 alpha-2.
     """
-    countries = countries or PLACES_COUNTRIES  # p.ej. 'us'
+    countries = countries or PLACES_COUNTRIES
     raw = [t.strip().lower() for t in re.split(r"[,\| ]+", countries) if t.strip()]
 
     alias = {
@@ -108,23 +108,31 @@ class NearestInfo(BaseModel):
     in_coverage: bool
     driving_distance_miles: Optional[float] = None  # por carretera (Distance Matrix)
 
-class AutocompleteItem(BaseModel):
+# SOLO para autocomplete (ligero)
+class AutocompleteLiteItem(BaseModel):
     description: str
     place_id: str
     types: List[str] = []
-    nearest: Optional[NearestInfo] = None   # sede más cercana + bandera de cobertura
-    delivery_cost_usd: Optional[float] = None  # AHORA: tarifa de Shipday (fallback a millas si falla)
 
+class AutocompleteLiteResponse(BaseModel):
+    predictions: List[AutocompleteLiteItem]
+    session_token: str
+
+# Para detalles de cobertura / costos
 class CoverageError(BaseModel):
     code: str
     message_es: str
     message_en: str
     coverage_radius_miles: float
 
-class AutocompleteResponse(BaseModel):
-    predictions: List[AutocompleteItem]
-    session_token: str
-    error: Optional[CoverageError] = None  # error solo si ninguna está en cobertura
+class CoverageDetailsResponse(BaseModel):
+    place_id: str
+    formatted_address: str
+    lat: float
+    lng: float
+    nearest: Optional[NearestInfo] = None
+    delivery_cost_usd: Optional[float] = None
+    error: Optional[CoverageError] = None
 
 # ─────────── Utilidades ───────────
 
@@ -138,12 +146,12 @@ def haversine_miles(lat1: float, lon1: float, lat2: float, lon2: float) -> float
     c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
     return R_miles * c
 
-def nearest_site_for(lat: float, lng: float, radius_miles: float = 8.0) -> NearestInfo:
+def nearest_site_for(lat: float, lng: float, radius_miles: float = 1000.0) -> NearestInfo:
     best = None
     best_dist = float("inf")
     for s in SEDES:
         slat = s["location"]["lat"]
-        slng = s["location"]["long"]  # clave 'long' en tu JSON
+        slng = s["location"]["long"]
         d = haversine_miles(lat, lng, slat, slng)
         if d < best_dist:
             best_dist = d
@@ -218,10 +226,9 @@ async def driving_distance_miles(
         "origins": f"{o_lat},{o_lng}",
         "destinations": f"{d_lat},{d_lng}",
         "mode": "driving",
-        "units": "imperial",   # 'text' será en millas; 'value' viene en metros
+        "units": "imperial",
         "language": language,
         "key": GOOGLE_API_KEY,
-        # opcional: "departure_time": "now", "traffic_model": "best_guess"
     }
     resp = await client.get(DISTANCE_MATRIX_URL, params=params, timeout=1000.0)
     if resp.status_code != 200:
@@ -241,7 +248,7 @@ async def driving_distance_miles(
     miles   = meters / 1609.344
     return float(miles), int(seconds)
 
-# ─────────── SHIPDAY (NUEVO) ───────────
+# ─────────── SHIPDAY ───────────
 
 async def shipday_quote_fee(
     client: httpx.AsyncClient,
@@ -251,7 +258,6 @@ async def shipday_quote_fee(
     """
     Pide a Shipday disponibilidad/tarifa entre (pickup) y (drop).
     Devuelve la tarifa mínima (fee) entre los servicios disponibles, o None si no hay tarifa.
-    NOTA: Asegúrate en tu cuenta de Shipday tener habilitado al menos un tercero (DoorDash, Uber, etc.)
     """
     headers = {
         "Authorization": SHIPDAY_API_KEY,
@@ -295,32 +301,29 @@ async def shipday_quote_fee(
     return min(fees)
 
 # ─────────── Endpoints ───────────
+#
+# 1) SOLO PREDICCIONES (ligero)
+# 2) DETALLES DE COBERTURA / COSTO (separado)
+# 3) /places/details y /distance (utilitarios existentes)
 
-@router.get("/places/autocomplete", response_model=AutocompleteResponse)
+@router.get("/places/autocomplete", response_model=AutocompleteLiteResponse)
 async def places_autocomplete(
     input: str = Query(..., min_length=1, description="Texto parcial de dirección"),
     session_token: Optional[str] = Query(None, description="Token de sesión para mejor facturación/resultados"),
     language: str = Query("es", description="Idioma de resultados"),
-    region: Optional[str] = Query(None, description="Código de país ISO-3166-1 alpha-2 (deprecated)"),
-    limit: int = Query(5, ge=1, le=10, description="Máximo de sugerencias"),
-    coverage_radius_miles: float = Query(8.0, gt=0, description="Radio de cobertura en millas"),
     countries: Optional[str] = Query(None, description="Códigos ISO-3166-1 alpha-2 separados por | o , (p.ej. 'us|pr')"),
+    limit: int = Query(5, ge=1, le=10, description="Máximo de sugerencias"),
 ):
     """
-    Devuelve SIEMPRE las predicciones de Google, con `nearest`.
-    Si ninguna cae en cobertura, incluye `error` (200 OK).
-    Calcula el costo consultando Shipday. Si Shipday no retorna tarifa, usa fallback por millas.
+    Devuelve SOLO las predicciones de Google (sin nearest ni costos).
     """
     if not GOOGLE_API_KEY:
         raise HTTPException(status_code=500, detail="No se configuró GOOGLE_MAPS_API_KEY")
 
     stoken = session_token or str(uuid.uuid4())
 
-    # components
+    # components (filtro por país/es)
     comps = _components_for(countries)
-    if region:
-        reg = _components_for(region)
-        comps = f"{comps}|{reg}" if (comps and reg) else (reg or comps)
 
     params = {
         "input": input,
@@ -341,15 +344,15 @@ async def places_autocomplete(
         status = data.get("status")
 
         if status == "ZERO_RESULTS":
-            return AutocompleteResponse(predictions=[], session_token=stoken)
+            return AutocompleteLiteResponse(predictions=[], session_token=stoken)
 
         if status != "OK":
             msg = data.get("error_message") or status or "Error en Autocomplete"
             raise HTTPException(status_code=400, detail=msg)
 
         raw_preds = data.get("predictions", [])[:limit]
-        items: List[AutocompleteItem] = [
-            AutocompleteItem(
+        items: List[AutocompleteLiteItem] = [
+            AutocompleteLiteItem(
                 description=p.get("description", ""),
                 place_id=p.get("place_id", ""),
                 types=p.get("types", []) or [],
@@ -357,94 +360,80 @@ async def places_autocomplete(
             for p in raw_preds
         ]
 
-    # Resolver coordenadas + nearest + Driving Matrix + Shipday en un solo cliente
-    async with httpx.AsyncClient() as client2:
-        # 1) Details (en paralelo)
-        tasks_details = [places_details(client2, it.place_id, stoken) for it in items]
-        results_details = await asyncio.gather(*tasks_details, return_exceptions=True)
+    return AutocompleteLiteResponse(predictions=items, session_token=stoken)
 
-        # 2) Calcular nearest por Haversine (rápido)
-        for it, res in zip(items, results_details):
-            if isinstance(res, Exception):
-                continue
-            plat, plng, _formatted = res
-            it.nearest = nearest_site_for(plat, plng, radius_miles=coverage_radius_miles)
+@router.get("/places/coverage-details", response_model=CoverageDetailsResponse)
+async def coverage_details(
+    place_id: str = Query(..., description="Place ID seleccionado por el usuario"),
+    session_token: Optional[str] = Query(None, description="Token de sesión usado en Autocomplete"),
+    coverage_radius_miles: float = Query(1000.0, gt=0, description="Radio de cobertura en millas"),
+    language: str = Query("es", description="Idioma para Distance Matrix"),
+):
+    """
+    Dado un place_id, resuelve su lat/lng, calcula la sede más cercana, la distancia por carretera (si aplica)
+    y el costo de entrega (Shipday con fallback por millas). Si no hay cobertura, responde con `error`.
+    """
+    # 1) Resolver coordenadas del destino
+    async with httpx.AsyncClient() as client:
+        try:
+            dlat, dlng, formatted = await places_details(client, place_id, session_token)
+        except HTTPException as e:
+            raise e
 
-        any_in_coverage = any(it.nearest and it.nearest.in_coverage for it in items)
+        # 2) Calcular nearest por Haversine
+        near = nearest_site_for(dlat, dlng, radius_miles=coverage_radius_miles)
 
-        if not any_in_coverage and items:
-            # No calculamos precio si no hay cobertura
-            return AutocompleteResponse(
-                predictions=items,
-                session_token=stoken,
+        if not near.in_coverage:
+            # fuera de cobertura → devolvemos error pero incluimos datos básicos
+            return CoverageDetailsResponse(
+                place_id=place_id,
+                formatted_address=formatted,
+                lat=dlat,
+                lng=dlng,
+                nearest=near,
+                delivery_cost_usd=None,
                 error=make_out_of_coverage_error(coverage_radius_miles),
             )
 
-        # 3) Para los que están en cobertura: calcular distancia de manejo (Google) y pedir tarifa a Shipday (en paralelo)
-        driving_tasks = []
-        shipday_tasks = []
-        driving_indices = []
-        shipday_indices = []
+        # 3) Dentro de cobertura → distancia por carretera y costo
+        s = near.site["location"]
 
-        for idx, (it, res) in enumerate(zip(items, results_details)):
-            if isinstance(res, Exception) or not it.nearest or not it.nearest.in_coverage:
-                continue
-
-            plat, plng, _formatted = res
-            s = it.nearest.site["location"]
-
-            # Google Distance Matrix (para mostrar driving_distance_miles)
-            driving_tasks.append(
-                driving_distance_miles(
-                    client2,
-                    s["lat"], s["long"],
-                    plat, plng,
-                    language=language
-                )
+        # Distance Matrix
+        try:
+            driving_miles, _ = await driving_distance_miles(
+                client,
+                s["lat"], s["long"],
+                dlat, dlng,
+                language=language
             )
-            driving_indices.append(idx)
+            near.driving_distance_miles = round(driving_miles, 2)
+        except Exception:
+            # Si falla, nos quedamos con Haversine ya calculado en near.distance_miles
+            pass
 
-            # Shipday quote para el costo de entrega
-            shipday_tasks.append(
-                shipday_quote_fee(
-                    client2,
-                    pickup_lat=s["lat"], pickup_lng=s["long"],
-                    drop_lat=plat, drop_lng=plng
-                )
-            )
-            shipday_indices.append(idx)
+        # Shipday
+        fee = await shipday_quote_fee(
+            client,
+            pickup_lat=s["lat"], pickup_lng=s["long"],
+            drop_lat=dlat, drop_lng=dlng
+        )
 
-        driving_results = await asyncio.gather(*driving_tasks, return_exceptions=True)
-        shipday_results = await asyncio.gather(*shipday_tasks, return_exceptions=True)
+        if isinstance(fee, (int, float)):
+            cost = math.ceil(float(fee))
+        else:
+            # Fallback por millas
+            d_miles = near.driving_distance_miles or near.distance_miles
+            cost = math.ceil(max(round(d_miles * DELIVERY_RATE_USD_PER_MILE, 2), DELIVERY_RATE_USD_PER_MILE))
 
-        # 4) Volcar distancia por carretera
-        for idx, dres in zip(driving_indices, driving_results):
-            it = items[idx]
-            if isinstance(dres, Exception):
-                # si falla Google, dejamos solo Haversine en nearest.distance_miles (ya calculado)
-                continue
-            d_miles, _secs = dres
-            it.nearest.driving_distance_miles = round(d_miles, 2)
-
-        # 5) Volcar costo desde Shipday (con fallback a millas si no hay tarifa)
-        for idx, sres in zip(shipday_indices, shipday_results):
-            it = items[idx]
-            fee = None if isinstance(sres, Exception) else sres
-            if isinstance(fee, (int, float)):
-                it.delivery_cost_usd = math.ceil(float(fee))
-            else:
-                # Fallback: precio con Haversine si falla Shipday
-                d_miles = it.nearest.driving_distance_miles or it.nearest.distance_miles
-                it.delivery_cost_usd = math.ceil(
-                    max(round(d_miles * DELIVERY_RATE_USD_PER_MILE, 2), DELIVERY_RATE_USD_PER_MILE)
-                )
-
-        # Los que no tienen cobertura: sin costo
-        for it in items:
-            if not it.nearest or not it.nearest.in_coverage:
-                it.delivery_cost_usd = None
-
-    return AutocompleteResponse(predictions=items, session_token=stoken)
+    return CoverageDetailsResponse(
+        place_id=place_id,
+        formatted_address=formatted,
+        lat=dlat,
+        lng=dlng,
+        nearest=near,
+        delivery_cost_usd=cost,
+        error=None
+    )
 
 @router.get("/places/details", response_model=GeocodedPoint)
 async def places_details_endpoint(
