@@ -1,7 +1,7 @@
 # main.py
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from routes import payments , cotizar
+from routes import payments , cotizar , cotizar_colombia
 import os
 
 app = FastAPI(title="Stripe Payments API")
@@ -19,6 +19,7 @@ app.add_middleware(
 # Rutas
 app.include_router(payments.router)
 app.include_router(cotizar.router)
+app.include_router(cotizar_colombia.router)
 
 
 @app.get("/")

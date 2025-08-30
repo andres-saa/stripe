@@ -23,12 +23,17 @@ if not SHIPDAY_API_KEY:
     print("⚠️  Falta SHIPDAY_API_KEY en el entorno (.env)")
 SHIPDAY_AVAILABILITY_URL = "https://api.shipday.com/on-demand/availability"
 
-# Fallback si Shipday no devuelve tarifa
+# Fallback si Shipday no devuelve tarifa (USD por milla)
 DELIVERY_RATE_USD_PER_MILE = float(os.getenv("DELIVERY_RATE_USD_PER_MILE", "1.5"))
+
+# Decimales para reportar distancia (km)
+DISTANCE_REPORT_DECIMALS = int(os.getenv("DISTANCE_REPORT_DECIMALS", "2"))
 
 router = APIRouter()
 
-# ─────────── SEDES (tus datos) ───────────
+# ─────────── SEDES (USA) ───────────
+from typing import List, Dict, Any
+
 SEDES: List[Dict[str, Any]] = [
     {
         "site_id": 33,
@@ -36,6 +41,16 @@ SEDES: List[Dict[str, Any]] = [
         "site_address": "2100 kerrigan ave union city nj 07087",
         "pe_site_id": 16,
         "location": {"lat": 40.76808, "long": -74.03843},
+        "pickup": {
+            "address": {
+                "zip": "07087",
+                "city": "Union City",
+                "unit": None,
+                "state": "NJ",
+                "street": "2100 Kerrigan Ave",
+                "country": "US",
+            }
+        },
     },
     {
         "site_id": 35,
@@ -43,6 +58,16 @@ SEDES: List[Dict[str, Any]] = [
         "site_address": "5759 Oxford ave, Philadelphia, PA 19149",
         "pe_site_id": 16,
         "location": {"lat": 40.03358, "long": -75.08501},
+        "pickup": {
+            "address": {
+                "zip": "19149",
+                "city": "Philadelphia",
+                "unit": None,
+                "state": "PA",
+                "street": "5759 Oxford Ave",
+                "country": "US",
+            }
+        },
     },
     {
         "site_id": 36,
@@ -50,8 +75,19 @@ SEDES: List[Dict[str, Any]] = [
         "site_address": "26 eckert ave Newark NJ 07112",
         "pe_site_id": 16,
         "location": {"lat": 40.71335, "long": -74.20744},
+        "pickup": {
+            "address": {
+                "zip": "07112",
+                "city": "Newark",
+                "unit": None,
+                "state": "NJ",
+                "street": "26 Eckert Ave",
+                "country": "US",
+            }
+        },
     },
 ]
+
 
 PLACES_COUNTRIES = os.getenv("PLACES_COUNTRIES", "us")  # p.ej. "us" o "us|pr"
 
@@ -80,7 +116,7 @@ def _components_for(countries: Optional[str] = None) -> Optional[str]:
         return None
     return "|".join(f"country:{c}" for c in norm)
 
-# ─────────── Modelos ───────────
+# ─────────── Modelos (mismo shape que CO) ───────────
 
 class DistanceRequest(BaseModel):
     origin: Optional[str] = Field(None, description="Dirección de origen")
@@ -108,7 +144,6 @@ class NearestInfo(BaseModel):
     in_coverage: bool
     driving_distance_miles: Optional[float] = None  # por carretera (Distance Matrix)
 
-# SOLO para autocomplete (ligero)
 class AutocompleteLiteItem(BaseModel):
     description: str
     place_id: str
@@ -118,12 +153,21 @@ class AutocompleteLiteResponse(BaseModel):
     predictions: List[AutocompleteLiteItem]
     session_token: str
 
-# Para detalles de cobertura / costos
 class CoverageError(BaseModel):
     code: str
     message_es: str
     message_en: str
-    coverage_radius_miles: float
+
+class Address(BaseModel):
+    unit: Optional[str] = None          # Apt/Suite/etc (subpremise)
+    street: str                         # "<street_number> <route>"
+    city: str
+    state: str                          # e.g. "NJ"
+    zip: str                            # postal_code
+    country: str
+
+class Dropoff(BaseModel):
+    address: Address  # <- SOLO address (igual que pides)
 
 class CoverageDetailsResponse(BaseModel):
     place_id: str
@@ -131,7 +175,9 @@ class CoverageDetailsResponse(BaseModel):
     lat: float
     lng: float
     nearest: Optional[NearestInfo] = None
-    delivery_cost_usd: Optional[float] = None
+    delivery_cost_cop: Optional[int] = None   # <- MISMO NOMBRE (aunque el valor es USD)
+    distance_km: Optional[float] = None       # <- MISMO NOMBRE
+    dropoff: Optional[Dropoff] = None
     error: Optional[CoverageError] = None
 
 # ─────────── Utilidades ───────────
@@ -158,12 +204,12 @@ def nearest_site_for(lat: float, lng: float, radius_miles: float = 1000.0) -> Ne
             best = s
     return NearestInfo(site=best, distance_miles=round(best_dist, 2), in_coverage=(best_dist <= radius_miles))
 
-def make_out_of_coverage_error(radius_miles: float) -> CoverageError:
+def make_out_of_coverage_error_by_city(city: str) -> CoverageError:
+    city_txt = city or "la ciudad indicada"
     return CoverageError(
         code="OUT_OF_COVERAGE",
-        message_es=f"Fuera de rango: no hay cobertura dentro de {radius_miles} millas de nuestras sedes.",
-        message_en=f"Out of range: no coverage within {radius_miles} miles of our locations.",
-        coverage_radius_miles=radius_miles,
+        message_es=f"No hay cobertura en {city_txt}. Aún no tenemos sedes en esa ciudad.",
+        message_en=f"No coverage in {city_txt}. We don't have locations in that city yet.",
     )
 
 async def geocode_address(client: httpx.AsyncClient, address: str) -> Tuple[float, float, str]:
@@ -188,6 +234,9 @@ async def places_details(
     place_id: str,
     session_token: Optional[str] = None
 ) -> Tuple[float, float, str]:
+    """
+    Versión ligera: NO devuelve components (se usa en otros endpoints ya existentes).
+    """
     if not GOOGLE_API_KEY:
         raise HTTPException(status_code=500, detail="No se configuró GOOGLE_MAPS_API_KEY")
     params = {
@@ -209,6 +258,81 @@ async def places_details(
     loc = res["geometry"]["location"]
     formatted = res.get("formatted_address", "")
     return float(loc["lat"]), float(loc["lng"]), formatted or place_id
+
+async def places_details_with_components(
+    client: httpx.AsyncClient,
+    place_id: str,
+    session_token: Optional[str] = None
+) -> Tuple[float, float, str, List[Dict[str, Any]]]:
+    """
+    Versión extendida: incluye address_components para construir dropoff.address.
+    """
+    if not GOOGLE_API_KEY:
+        raise HTTPException(status_code=500, detail="No se configuró GOOGLE_MAPS_API_KEY")
+    params = {
+        "place_id": place_id,
+        "key": GOOGLE_API_KEY,
+        "fields": "formatted_address,geometry,address_component"
+    }
+    if session_token:
+        params["sessiontoken"] = session_token
+    resp = await client.get(PLACES_DETAILS_URL, params=params, timeout=1000.0)
+    if resp.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"Error en Place Details: HTTP {resp.status_code}")
+    data = resp.json()
+    status = data.get("status")
+    if status != "OK" or not data.get("result"):
+        msg = data.get("error_message") or status or "Sin resultados"
+        raise HTTPException(status_code=400, detail=f"No se pudo resolver place_id '{place_id}': {msg}")
+    res = data["result"]
+    loc = res["geometry"]["location"]
+    formatted = res.get("formatted_address", "")
+    comps = res.get("address_components", []) or []
+    return float(loc["lat"]), float(loc["lng"]), (formatted or place_id), comps
+
+def _find_component(comps: List[Dict[str, Any]], type_name: str, short: bool = True) -> str:
+    for c in comps:
+        if type_name in (c.get("types") or []):
+            # country/state conviene short_name (US, NJ)
+            return c.get("short_name") if short and c.get("short_name") else c.get("long_name", "")
+    return ""
+
+def _build_address_from_components(comps: List[Dict[str, Any]]) -> Tuple[Address, str]:
+    street_number = _find_component(comps, "street_number", short=False)
+    route = _find_component(comps, "route", short=False)
+    street = f"{street_number} {route}".strip() if (street_number or route) else ""
+
+    city = (
+        _find_component(comps, "locality", short=False)
+        or _find_component(comps, "sublocality", short=False)
+        or _find_component(comps, "administrative_area_level_2", short=False)
+        or ""
+    )
+
+    state = _find_component(comps, "administrative_area_level_1", short=True) or ""
+    zip_code = _find_component(comps, "postal_code", short=False) or ""
+    country = _find_component(comps, "country", short=True) or ""  # ISO-2
+    unit = _find_component(comps, "subpremise", short=False) or None
+
+    # Limpieza
+    street = re.sub(r"\s+", " ", street).strip()
+    city = re.sub(r"\s+", " ", city).strip()
+
+    addr = Address(
+        unit=unit,
+        street=street,
+        city=city,
+        state=state,
+        zip=zip_code,
+        country=country
+    )
+
+    # Siempre en formato ST_NUM, ST_NAME, CITY, STATE, ZIP, COUNTRY
+    raw_address = ", ".join(
+        filter(None, [street_number, route, city, state, zip_code, country])
+    )
+
+    return addr, raw_address
 
 async def driving_distance_miles(
     client: httpx.AsyncClient,
@@ -248,7 +372,7 @@ async def driving_distance_miles(
     miles   = meters / 1609.344
     return float(miles), int(seconds)
 
-# ─────────── SHIPDAY ───────────
+# ─────────── SHIPDAY (Availability) ───────────
 
 async def shipday_quote_fee(
     client: httpx.AsyncClient,
@@ -260,7 +384,7 @@ async def shipday_quote_fee(
     Devuelve la tarifa mínima (fee) entre los servicios disponibles, o None si no hay tarifa.
     """
     headers = {
-        "Authorization": SHIPDAY_API_KEY,
+        "Authorization": SHIPDAY_API_KEY,   # On-Demand Availability usa este header
         "Content-Type": "application/json",
         "Accept": "application/json",
     }
@@ -301,10 +425,6 @@ async def shipday_quote_fee(
     return min(fees)
 
 # ─────────── Endpoints ───────────
-#
-# 1) SOLO PREDICCIONES (ligero)
-# 2) DETALLES DE COBERTURA / COSTO (separado)
-# 3) /places/details y /distance (utilitarios existentes)
 
 @router.get("/places/autocomplete", response_model=AutocompleteLiteResponse)
 async def places_autocomplete(
@@ -321,8 +441,6 @@ async def places_autocomplete(
         raise HTTPException(status_code=500, detail="No se configuró GOOGLE_MAPS_API_KEY")
 
     stoken = session_token or str(uuid.uuid4())
-
-    # components (filtro por país/es)
     comps = _components_for(countries)
 
     params = {
@@ -370,35 +488,41 @@ async def coverage_details(
     language: str = Query("es", description="Idioma para Distance Matrix"),
 ):
     """
-    Dado un place_id, resuelve su lat/lng, calcula la sede más cercana, la distancia por carretera (si aplica)
-    y el costo de entrega (Shipday con fallback por millas). Si no hay cobertura, responde con `error`.
+    Dado un place_id, resuelve su lat/lng, calcula la sede más cercana, la distancia por carretera,
+    pide la tarifa a Shipday (Availability) y devuelve TODO con el MISMO SHAPE que Colombia:
+    - delivery_cost_cop (int)
+    - distance_km (float)
+    - dropoff.address (sin extras)
     """
-    # 1) Resolver coordenadas del destino
     async with httpx.AsyncClient() as client:
-        try:
-            dlat, dlng, formatted = await places_details(client, place_id, session_token)
-        except HTTPException as e:
-            raise e
+        # 1) Resolver coordenadas + address_components del destino
+        dlat, dlng, formatted, comps = await places_details_with_components(client, place_id, session_token)
+
+        # Construir dropoff.address desde components (sin raw_address)
+        address, _raw_address = _build_address_from_components(comps)
+        dropoff = Dropoff(address=address)
 
         # 2) Calcular nearest por Haversine
         near = nearest_site_for(dlat, dlng, radius_miles=coverage_radius_miles)
 
         if not near.in_coverage:
-            # fuera de cobertura → devolvemos error pero incluimos datos básicos
+            # fuera de cobertura → devolvemos error pero incluimos dropoff
             return CoverageDetailsResponse(
                 place_id=place_id,
                 formatted_address=formatted,
                 lat=dlat,
                 lng=dlng,
-                nearest=near,
-                delivery_cost_usd=None,
-                error=make_out_of_coverage_error(coverage_radius_miles),
+                nearest=None,
+                delivery_cost_cop=None,
+                distance_km=None,
+                dropoff=dropoff,
+                error=make_out_of_coverage_error_by_city(address.city),
             )
 
         # 3) Dentro de cobertura → distancia por carretera y costo
         s = near.site["location"]
 
-        # Distance Matrix
+        # Distance Matrix (millas de conducción) -> km
         try:
             driving_miles, _ = await driving_distance_miles(
                 client,
@@ -407,11 +531,14 @@ async def coverage_details(
                 language=language
             )
             near.driving_distance_miles = round(driving_miles, 2)
+            distance_km = driving_miles * 1.609344
         except Exception:
-            # Si falla, nos quedamos con Haversine ya calculado en near.distance_miles
-            pass
+            # Fallback: Haversine en km
+            distance_km = near.distance_miles * 1.609344
 
-        # Shipday
+        distance_km_report = round(distance_km, DISTANCE_REPORT_DECIMALS)
+
+        # Shipday availability (valor / fee en USD) -> usamos mismo campo delivery_cost_cop
         fee = await shipday_quote_fee(
             client,
             pickup_lat=s["lat"], pickup_lng=s["long"],
@@ -419,11 +546,12 @@ async def coverage_details(
         )
 
         if isinstance(fee, (int, float)):
-            cost = math.ceil(float(fee))
+            # Mantener nombre del campo: delivery_cost_cop (pero es USD)
+            cost_int = int(math.ceil(float(fee)))
         else:
-            # Fallback por millas
-            d_miles = near.driving_distance_miles or near.distance_miles
-            cost = math.ceil(max(round(d_miles * DELIVERY_RATE_USD_PER_MILE, 2), DELIVERY_RATE_USD_PER_MILE))
+            # Fallback por millas (USD), mismo campo
+            d_miles = near.driving_distance_miles or (distance_km / 1.609344)
+            cost_int = int(math.ceil(max(round(d_miles * DELIVERY_RATE_USD_PER_MILE, 2), DELIVERY_RATE_USD_PER_MILE)))
 
     return CoverageDetailsResponse(
         place_id=place_id,
@@ -431,7 +559,9 @@ async def coverage_details(
         lat=dlat,
         lng=dlng,
         nearest=near,
-        delivery_cost_usd=cost,
+        delivery_cost_cop=cost_int,   # <- MISMO CAMPO
+        distance_km=distance_km_report,
+        dropoff=dropoff,
         error=None
     )
 
