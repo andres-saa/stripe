@@ -175,8 +175,8 @@ class CoverageDetailsResponse(BaseModel):
     lat: float
     lng: float
     nearest: Optional[NearestInfo] = None
-    delivery_cost_cop: Optional[int] = None   # <- MISMO NOMBRE (aunque el valor es USD)
-    distance_km: Optional[float] = None       # <- MISMO NOMBRE
+    delivery_cost_cop: Optional[int] = None   # (sigue siendo USD si viene de Shipday)
+    distance_miles: Optional[float] = None    # ⬅️ ahora reportamos millas
     dropoff: Optional[Dropoff] = None
     error: Optional[CoverageError] = None
 
@@ -488,11 +488,11 @@ async def coverage_details(
     language: str = Query("es", description="Idioma para Distance Matrix"),
 ):
     """
-    Dado un place_id, resuelve su lat/lng, calcula la sede más cercana, la distancia por carretera,
-    pide la tarifa a Shipday (Availability) y devuelve TODO con el MISMO SHAPE que Colombia:
-    - delivery_cost_cop (int)
-    - distance_km (float)
-    - dropoff.address (sin extras)
+    Dado un place_id, resuelve su lat/lng, calcula la sede más cercana, la distancia por carretera (MILLAS),
+    pide la tarifa a Shipday (Availability) y devuelve TODO:
+    - delivery_cost_cop (int)  -> USD si viene de Shipday (nombre conservado por compatibilidad)
+    - distance_miles (float)   -> DISTANCIA EN MILLAS
+    - dropoff.address
     """
     async with httpx.AsyncClient() as client:
         # 1) Resolver coordenadas + address_components del destino
@@ -514,15 +514,15 @@ async def coverage_details(
                 lng=dlng,
                 nearest=None,
                 delivery_cost_cop=None,
-                distance_km=None,
+                distance_miles=None,   # ⬅️ millas
                 dropoff=dropoff,
                 error=make_out_of_coverage_error_by_city(address.city),
             )
 
-        # 3) Dentro de cobertura → distancia por carretera y costo
+        # 3) Dentro de cobertura → distancia por carretera (MILLAS) y costo
         s = near.site["location"]
 
-        # Distance Matrix (millas de conducción) -> km
+        # Distance Matrix (millas de conducción)
         try:
             driving_miles, _ = await driving_distance_miles(
                 client,
@@ -531,14 +531,14 @@ async def coverage_details(
                 language=language
             )
             near.driving_distance_miles = round(driving_miles, 2)
-            distance_km = driving_miles * 1.609344
+            d_miles = driving_miles
         except Exception:
-            # Fallback: Haversine en km
-            distance_km = near.distance_miles * 1.609344
+            # Fallback: Haversine en millas
+            d_miles = near.distance_miles
 
-        distance_km_report = round(distance_km, DISTANCE_REPORT_DECIMALS)
+        distance_miles_report = round(float(d_miles), DISTANCE_REPORT_DECIMALS)
 
-        # Shipday availability (valor / fee en USD) -> usamos mismo campo delivery_cost_cop
+        # Shipday availability (fee USD) -> usamos mismo campo delivery_cost_cop
         fee = await shipday_quote_fee(
             client,
             pickup_lat=s["lat"], pickup_lng=s["long"],
@@ -550,8 +550,8 @@ async def coverage_details(
             cost_int = int(math.ceil(float(fee)))
         else:
             # Fallback por millas (USD), mismo campo
-            d_miles = near.driving_distance_miles or (distance_km / 1.609344)
-            cost_int = int(math.ceil(max(round(d_miles * DELIVERY_RATE_USD_PER_MILE, 2), DELIVERY_RATE_USD_PER_MILE)))
+            miles_for_cost = near.driving_distance_miles or d_miles
+            cost_int = int(math.ceil(max(round(miles_for_cost * DELIVERY_RATE_USD_PER_MILE, 2), DELIVERY_RATE_USD_PER_MILE)))
 
     return CoverageDetailsResponse(
         place_id=place_id,
@@ -559,8 +559,8 @@ async def coverage_details(
         lat=dlat,
         lng=dlng,
         nearest=near,
-        delivery_cost_cop=cost_int,   # <- MISMO CAMPO
-        distance_km=distance_km_report,
+        delivery_cost_cop=cost_int,     # USD
+        distance_miles=distance_miles_report,  # ⬅️ millas
         dropoff=dropoff,
         error=None
     )
