@@ -72,16 +72,16 @@ SEDES: List[Dict[str, Any]] = [
     {
         "site_id": 36,
         "site_name": "NEWARK",
-        "site_address": "26 eckert ave Newark NJ 07112",
+        "site_address": "2100 kerrigan ave union city nj 07087",
         "pe_site_id": 16,
         "location": {"lat": 40.71335, "long": -74.20744},
         "pickup": {
             "address": {
-                "zip": "07112",
-                "city": "Newark",
+                "zip": "07087",
+                "city": "Union City",
                 "unit": None,
                 "state": "NJ",
-                "street": "26 Eckert Ave",
+                "street": "2100 Kerrigan Ave",
                 "country": "US",
             }
         },
