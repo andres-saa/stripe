@@ -32,6 +32,8 @@ DELIVERY_RATE_USD_PER_MILE = float(os.getenv("DELIVERY_RATE_USD_PER_MILE", "1.5"
 DISTANCE_REPORT_DECIMALS = int(os.getenv("DISTANCE_REPORT_DECIMALS", "2"))
 # Países permitidos para Places
 PLACES_COUNTRIES = os.getenv("PLACES_COUNTRIES", "us")  # p.ej. "us" o "us|pr"
+# Límite de cobertura por distancia conducida (mi)
+MAX_DRIVING_DISTANCE_MILES = float(os.getenv("MAX_DRIVING_DISTANCE_MILES", "9.5"))
 
 router = APIRouter()
 
@@ -476,6 +478,14 @@ def _as_int(val: Any) -> Optional[int]:
         m = re.search(r"\d+", val)
         return int(m.group(0)) if m else None
     return None
+
+class ShipdayAvailability(BaseModel):
+    provider: str
+    fee: float
+    pickup_duration_minutes: Optional[int] = None
+    delivery_duration_minutes: Optional[int] = None
+    pickup_time_iso: Optional[str] = None
+    delivery_time_iso: Optional[str] = None
 
 async def shipday_quote_fee_by_address(
     client: httpx.AsyncClient,
@@ -943,19 +953,53 @@ async def coverage_details(
                 error=make_out_of_coverage_error_by_city(address.city),
             )
 
+        # Distancia por conducción
         s = near.site["location"]
         try:
-            driving_miles, _ = await driving_distance_miles(client, s["lat"], s["long"], dlat, dlng, language=language)
+            driving_miles, _ = await driving_distance_miles(
+                client, s["lat"], s["long"], dlat, dlng, language=language
+            )
             near.driving_distance_miles = round(driving_miles, 2)
             d_miles = driving_miles
         except Exception:
+            # fallback si falla Distance Matrix: usar haversine
             d_miles = near.distance_miles
+            near.driving_distance_miles = None
+
+        # ── Regla de cobertura por distancia CONDUCIDA ──
+        if d_miles is not None and float(d_miles) > MAX_DRIVING_DISTANCE_MILES:
+            return CoverageDetailsResponse(
+                place_id=place_id,
+                formatted_address=strict_label,
+                lat=dlat,
+                lng=dlng,
+                nearest=near,
+                delivery_cost_cop=None,
+                distance_miles=None,  # mantenemos None en error para no romper front
+                dropoff=dropoff,
+                pickup_duration_minutes=None,
+                delivery_duration_minutes=None,
+                pickup_time_iso=None,
+                delivery_time_iso=None,
+                error=CoverageError(
+                    code="OUT_OF_COVERAGE",
+                    message_es=(
+                        f"Fuera de cobertura: la distancia por conducción supera "
+                        f"{MAX_DRIVING_DISTANCE_MILES} millas."
+                    ),
+                    message_en=(
+                        f"Out of coverage: driving distance exceeds "
+                        f"{MAX_DRIVING_DISTANCE_MILES} miles."
+                    ),
+                ),
+            )
 
         distance_miles_report = round(float(d_miles), DISTANCE_REPORT_DECIMALS)
 
         pickup_addr_str   = _site_pickup_address_str(near.site)
         delivery_addr_str = strict_label  # ya en formato estricto
 
+        # Intentar cotizar con Shipday (solo si está dentro de cobertura por distancia)
         sd = await shipday_quote_fee_by_address(
             client,
             pickup_address=pickup_addr_str,
