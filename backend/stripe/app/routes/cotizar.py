@@ -74,7 +74,7 @@ SEDES: List[Dict[str, Any]] = [
         "pe_site_id": 16,
         "location": {"lat": 40.71335, "long": -74.20744},
         "pickup": {
-            "address": {
+                "address": {
                 "zip": "07087",
                 "city": "Union City",
                 "unit": None,
@@ -86,11 +86,7 @@ SEDES: List[Dict[str, Any]] = [
     },
 ]
 
-PLACES_COUNTRIES = os.getenv("PLACES_COUNTRIES", "us")  # p.ej. "us" o "us|pr"\
-
-
-
-
+PLACES_COUNTRIES = os.getenv("PLACES_COUNTRIES", "us")  # p.ej. "us" o "us|pr"
 
 def _components_for(countries: Optional[str] = None) -> Optional[str]:
     """
@@ -257,7 +253,6 @@ def _format_address_strict(addr: "Address") -> str:
     if errs:
         raise ValueError(", ".join(errs))
     # ST_NUM ST_NAME, CITY, STATE ZIP, COUNTRY
-    # addr.street ya es "NUM NAME"
     line2 = " ".join([p for p in [addr.state, addr.zip] if p])
     return ", ".join([addr.street, addr.city, line2, addr.country])
 
@@ -335,7 +330,7 @@ async def places_details(
     res = data["result"]
     loc = res["geometry"]["location"]
     formatted = res.get("formatted_address", "")
-    return float(loc["lat"]), float(lng := loc["lng"]), formatted or place_id  # noqa
+    return float(loc["lat"]), float(loc["lng"]), formatted or place_id
 
 async def places_details_with_components(
     client: httpx.AsyncClient,
@@ -556,7 +551,7 @@ async def shipday_quote_fee(
     drop_lat: float, drop_lng: float
 ) -> Optional[float]:
     headers = {
-        "Authorization": SHIPDAY_API_KEY,
+        "Authorization": _shipday_auth_value(),
         "Content-Type": "application/json",
         "Accept": "application/json",
     }
@@ -619,29 +614,7 @@ async def shipday_quote_fee(
 
     return min(uber_fees) if uber_fees else None
 
-# ─────────── Endpoints ───────────
 # ─────────── Helper: valida y arma etiqueta estricta ───────────
-async def _strict_label_from_place(
-    client: httpx.AsyncClient,
-    place_id: str,
-    session_token: Optional[str]
-) -> Optional[Tuple[Address, str]]:
-    try:
-        _lat, _lng, _formatted, comps = await places_details_with_components(
-            client, place_id, session_token
-        )
-        addr, _raw = _build_address_from_components(comps)
-        errs = _validate_address_required(addr)
-        if errs:
-            return None
-        label = _address_to_str(addr)  # "NUM STREET, CITY, ST ZIP, COUNTRY"
-        return addr, label
-    except Exception:
-        return None
-
-
-
-
 async def _strict_label_from_place(
     client: httpx.AsyncClient,
     place_id: str,
@@ -659,12 +632,10 @@ async def _strict_label_from_place(
         errs = _validate_address_required(addr)
         if errs:
             return None
-        # Cadena estricta (lanza si faltara algo, pero ya validamos arriba)
-        label = _address_to_str(addr)
+        label = _address_to_str(addr)  # "NUM STREET, CITY, ST ZIP, COUNTRY"
         return addr, label
     except Exception:
         return None
-
 
 # ─────────── Autocomplete ESTRICTO: solo direcciones válidas ───────────
 @router.get("/places/autocomplete", response_model=AutocompleteLiteResponse)
@@ -724,7 +695,7 @@ async def places_autocomplete(
             ]
             return AutocompleteLiteResponse(predictions=items, session_token=stoken)
 
-        # Estricto: validamos cada candidate con Place Details (en paralelo)
+        # Estricto: validamos cada candidato con Place Details (en paralelo)
         tasks = [
             _strict_label_from_place(client, p.get("place_id", ""), stoken)
             for p in raw_preds if p.get("place_id")
@@ -738,14 +709,13 @@ async def places_autocomplete(
             if isinstance(det, Exception) or not det:
                 continue
             _addr, strict_label = det
-            # Evitar duplicados exactos por si Google repite variantes
             if strict_label in seen_labels:
                 continue
             seen_labels.add(strict_label)
 
             strict_items.append(
                 AutocompleteLiteItem(
-                    description=strict_label,                 # <<— YA VIENE BIEN FORMADA
+                    description=strict_label,  # <<— YA VIENE BIEN FORMADA
                     place_id=p.get("place_id", ""),
                     types=p.get("types", []) or [],
                 )
@@ -754,7 +724,6 @@ async def places_autocomplete(
                 break
 
         return AutocompleteLiteResponse(predictions=strict_items, session_token=stoken)
-
 
 @router.get("/places/coverage-details", response_model=CoverageDetailsResponse)
 async def coverage_details(
@@ -842,7 +811,7 @@ async def coverage_details(
 
         # Formato estricto para Shipday (pickup y delivery)
         pickup_addr_str   = _site_pickup_address_str(near.site)    # valida y formatea
-        delivery_addr_str = _address_to_str(address)               # valida y forma "ST_NUM ST_NAME, CITY, STATE ZIP, COUNTRY"
+        delivery_addr_str = _address_to_str(address)               # "ST_NUM ST_NAME, CITY, STATE ZIP, COUNTRY"
 
         sd = await shipday_quote_fee_by_address(
             client,
@@ -882,9 +851,6 @@ async def coverage_details(
         error=None
     )
 
-
-
-
 @router.get("/places/details", response_model=GeocodedPoint)
 async def places_details_endpoint(
     place_id: str = Query(..., description="Place ID a resolver"),
@@ -897,7 +863,7 @@ async def places_details_endpoint(
 @router.post("/distance", response_model=DistanceResponse)
 async def compute_distance(
     body: DistanceRequest,
-    method: str = Query("driving", pattern=r"^(haversine|driving)$")
+    method: str = Query("driving", regex=r"^(haversine|driving)$")  # usar 'regex' por compatibilidad
 ):
     async with httpx.AsyncClient() as client:
         if body.origin_place_id:
