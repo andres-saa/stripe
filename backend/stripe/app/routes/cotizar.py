@@ -91,28 +91,6 @@ PLACES_COUNTRIES = os.getenv("PLACES_COUNTRIES", "us")  # p.ej. "us" o "us|pr"\
 
 
 
-async def _strict_label_from_place(
-    client: httpx.AsyncClient,
-    place_id: str,
-    session_token: Optional[str]
-) -> Optional[Tuple[Address, str]]:
-    """
-    Devuelve (Address, 'ST_NUM ST_NAME, CITY, ST ZIP, COUNTRY') si el place_id
-    es una dirección completa; en caso contrario, None.
-    """
-    try:
-        _lat, _lng, _formatted, comps = await places_details_with_components(
-            client, place_id, session_token
-        )
-        addr, _raw = _build_address_from_components(comps)
-        errs = _validate_address_required(addr)
-        if errs:
-            return None
-        # Cadena estricta (lanza si faltara algo, pero ya validamos arriba)
-        label = _address_to_str(addr)
-        return addr, label
-    except Exception:
-        return None
 
 def _components_for(countries: Optional[str] = None) -> Optional[str]:
     """
@@ -657,6 +635,32 @@ async def _strict_label_from_place(
         if errs:
             return None
         label = _address_to_str(addr)  # "NUM STREET, CITY, ST ZIP, COUNTRY"
+        return addr, label
+    except Exception:
+        return None
+
+
+
+
+async def _strict_label_from_place(
+    client: httpx.AsyncClient,
+    place_id: str,
+    session_token: Optional[str]
+) -> Optional[Tuple[Address, str]]:
+    """
+    Devuelve (Address, 'ST_NUM ST_NAME, CITY, ST ZIP, COUNTRY') si el place_id
+    es una dirección completa; en caso contrario, None.
+    """
+    try:
+        _lat, _lng, _formatted, comps = await places_details_with_components(
+            client, place_id, session_token
+        )
+        addr, _raw = _build_address_from_components(comps)
+        errs = _validate_address_required(addr)
+        if errs:
+            return None
+        # Cadena estricta (lanza si faltara algo, pero ya validamos arriba)
+        label = _address_to_str(addr)
         return addr, label
     except Exception:
         return None
