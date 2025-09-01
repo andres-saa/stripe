@@ -74,7 +74,7 @@ SEDES: List[Dict[str, Any]] = [
         "pe_site_id": 16,
         "location": {"lat": 40.71335, "long": -74.20744},
         "pickup": {
-                "address": {
+            "address": {
                 "zip": "07087",
                 "city": "Union City",
                 "unit": None,
@@ -175,7 +175,6 @@ class CoverageDetailsResponse(BaseModel):
     delivery_cost_cop: Optional[int] = None   # (en USD si viene de Shipday; nombre por compat)
     distance_miles: Optional[float] = None
     dropoff: Optional[Dropoff] = None
-    # NUEVOS CAMPOS (de Shipday):
     pickup_duration_minutes: Optional[int] = None     # ← pickupDuration
     delivery_duration_minutes: Optional[int] = None   # ← deliveryDuration
     pickup_time_iso: Optional[str] = None             # ← pickupTime
@@ -227,11 +226,6 @@ def make_out_of_coverage_error_by_city(city: str) -> CoverageError:
 _STREET_RE = re.compile(r"^\s*(\d+)\s+(.+?)\s*$")  # exige número y nombre de vía
 
 def _validate_address_required(addr: "Address") -> List[str]:
-    """
-    Verifica que la dirección cumpla el formato:
-      ST_NUM ST_NAME, CITY, STATE, ZIP, COUNTRY
-    Devuelve lista de errores (vacía si todo OK).
-    """
     errors: List[str] = []
     if not addr.street or not _STREET_RE.match(addr.street):
         errors.append("street (debe incluir número y nombre de vía)")
@@ -246,13 +240,9 @@ def _validate_address_required(addr: "Address") -> List[str]:
     return errors
 
 def _format_address_strict(addr: "Address") -> str:
-    """
-    Formatea SI y SOLO SI es válida. Si falta algo, lanza ValueError.
-    """
     errs = _validate_address_required(addr)
     if errs:
         raise ValueError(", ".join(errs))
-    # ST_NUM ST_NAME, CITY, STATE ZIP, COUNTRY
     line2 = " ".join([p for p in [addr.state, addr.zip] if p])
     return ", ".join([addr.street, addr.city, line2, addr.country])
 
@@ -260,10 +250,6 @@ def _join_nonempty(parts: List[str], sep: str = ", ") -> str:
     return sep.join([p for p in parts if p and str(p).strip()])
 
 def _site_pickup_address_str(site: Dict[str, Any]) -> str:
-    """
-    Devuelve pickup en formato estricto ST_NUM ST_NAME, CITY, STATE ZIP, COUNTRY
-    Lanza HTTP 500 si la sede está mal configurada (es obligatorio).
-    """
     pickup_addr = (site.get("pickup") or {}).get("address") or {}
     if not pickup_addr:
         raise HTTPException(status_code=500, detail=f"sede '{site.get('site_name')}' sin pickup.address configurado")
@@ -285,7 +271,6 @@ def _site_pickup_address_str(site: Dict[str, Any]) -> str:
         )
 
 def _address_to_str(addr: "Address") -> str:
-    # Igual formato estricto para dropoff
     return _format_address_strict(addr)
 
 async def geocode_address(client: httpx.AsyncClient, address: str) -> Tuple[float, float, str]:
@@ -461,14 +446,6 @@ async def shipday_quote_fee_by_address(
     delivery_address: str,
     delivery_time_iso: Optional[str] = None
 ) -> Optional[ShipdayAvailability]:
-    """
-    Devuelve la mejor opción del proveedor preferido (e.g., 'uber') con:
-      - fee
-      - pickup_duration_minutes   (desde pickupDuration)
-      - delivery_duration_minutes (desde deliveryDuration)
-      - pickup_time_iso           (desde pickupTime)
-      - delivery_time_iso         (desde deliveryTime)
-    """
     if not SHIPDAY_API_KEY:
         return None
 
@@ -482,7 +459,7 @@ async def shipday_quote_fee_by_address(
         "deliveryAddress": delivery_address,
     }
     if delivery_time_iso:
-        payload["deliveryTime"] = delivery_time_iso  # ISO-8601 en UTC, opcional
+        payload["deliveryTime"] = delivery_time_iso
 
     try:
         resp = await client.post(SHIPDAY_AVAILABILITY_URL, headers=headers, json=payload, timeout=1000.0)
@@ -544,7 +521,7 @@ async def shipday_quote_fee_by_address(
 
     return best
 
-# (Versión por coordenadas se mantiene por compatibilidad)
+# (Versión por coordenadas para compatibilidad)
 async def shipday_quote_fee(
     client: httpx.AsyncClient,
     pickup_lat: float, pickup_lng: float,
@@ -614,16 +591,13 @@ async def shipday_quote_fee(
 
     return min(uber_fees) if uber_fees else None
 
-# ─────────── Helper: valida y arma etiqueta estricta ───────────
+# ─────────── Helpers de Autocomplete ───────────
+
 async def _strict_label_from_place(
     client: httpx.AsyncClient,
     place_id: str,
     session_token: Optional[str]
 ) -> Optional[Tuple[Address, str]]:
-    """
-    Devuelve (Address, 'ST_NUM ST_NAME, CITY, ST ZIP, COUNTRY') si el place_id
-    es una dirección completa; en caso contrario, None.
-    """
     try:
         _lat, _lng, _formatted, comps = await places_details_with_components(
             client, place_id, session_token
@@ -637,7 +611,86 @@ async def _strict_label_from_place(
     except Exception:
         return None
 
-# ─────────── Autocomplete ESTRICTO: solo direcciones válidas ───────────
+FALLBACK_STREETS_US = [
+    "Main St", "Market St", "Broadway",
+    "First Ave", "Second St", "Third Ave",
+    "Maple Ave", "Oak St", "Pine St",
+    "Cedar St", "Washington St", "Church St",
+    "Center St", "High St", "Elm St"
+]
+
+async def _fallback_address_suggestions(
+    client: httpx.AsyncClient,
+    base_input: str,
+    stoken: str,
+    language: str,
+    comps: Optional[str],
+    limit: int
+) -> List[AutocompleteLiteItem]:
+    """
+    Si no hay suficientes direcciones estrictas, genera consultas “sembradas”
+    como '<input> Main St' y valida resultados hasta completar `limit`.
+    """
+    results: List[AutocompleteLiteItem] = []
+    seen_place_ids: set = set()
+    seen_labels: set = set()
+
+    # Intento 1: usar varias calles frecuentes en USA
+    for street in FALLBACK_STREETS_US:
+        if len(results) >= limit:
+            break
+        aug = f"{base_input} {street}".strip()
+        params = {
+            "input": aug,
+            "key": GOOGLE_API_KEY,
+            "language": language,
+            "sessiontoken": stoken,
+            "types": "address",
+        }
+        if comps:
+            params["components"] = comps
+
+        try:
+            resp = await client.get(PLACES_AUTOCOMPLETE_URL, params=params, timeout=10.0)
+            if resp.status_code != 200:
+                continue
+            data = resp.json()
+            if data.get("status") != "OK":
+                continue
+            preds = (data.get("predictions") or [])[:5]
+        except Exception:
+            continue
+
+        # Validar cada candidata con Place Details
+        tasks = [
+            _strict_label_from_place(client, p.get("place_id", ""), stoken)
+            for p in preds if p.get("place_id")
+        ]
+        details = await asyncio.gather(*tasks, return_exceptions=True)
+
+        for p, det in zip(preds, details):
+            if isinstance(det, Exception) or not det:
+                continue
+            _addr, label = det
+            pid = p.get("place_id", "")
+            if not pid or pid in seen_place_ids or label in seen_labels:
+                continue
+            seen_place_ids.add(pid)
+            seen_labels.add(label)
+            results.append(
+                AutocompleteLiteItem(
+                    description=label,
+                    place_id=pid,
+                    types=p.get("types", []) or [],
+                )
+            )
+            if len(results) >= limit:
+                break
+
+    return results
+
+# ─────────── Endpoints ───────────
+
 @router.get("/places/autocomplete", response_model=AutocompleteLiteResponse)
 async def places_autocomplete(
     input: str = Query(..., min_length=1, description="Texto parcial de dirección"),
@@ -653,7 +706,7 @@ async def places_autocomplete(
     stoken = session_token or str(uuid.uuid4())
     comps = _components_for(countries)
 
-    # Pedimos más de lo necesario para poder filtrar (sin dejar al usuario sin opciones)
+    # Pedimos más de lo necesario para poder filtrar
     oversample_factor = 3
     fetch_n = min(20, max(limit, limit * oversample_factor))
 
@@ -675,15 +728,13 @@ async def places_autocomplete(
         data = resp.json()
         status = data.get("status")
 
-        if status == "ZERO_RESULTS":
-            return AutocompleteLiteResponse(predictions=[], session_token=stoken)
-
-        if status != "OK":
+        if status not in ("OK", "ZERO_RESULTS"):
             msg = data.get("error_message") or status or "Error en Autocomplete"
             raise HTTPException(status_code=400, detail=msg)
 
         raw_preds = (data.get("predictions") or [])[:fetch_n]
 
+        # Modo no estricto → devolver tal cual (para debug/manual)
         if not strict:
             items = [
                 AutocompleteLiteItem(
@@ -695,7 +746,7 @@ async def places_autocomplete(
             ]
             return AutocompleteLiteResponse(predictions=items, session_token=stoken)
 
-        # Estricto: validamos cada candidato con Place Details (en paralelo)
+        # Estricto: validar con Place Details en paralelo
         tasks = [
             _strict_label_from_place(client, p.get("place_id", ""), stoken)
             for p in raw_preds if p.get("place_id")
@@ -704,7 +755,6 @@ async def places_autocomplete(
 
         strict_items: List[AutocompleteLiteItem] = []
         seen_labels = set()
-
         for p, det in zip(raw_preds, details_results):
             if isinstance(det, Exception) or not det:
                 continue
@@ -712,10 +762,9 @@ async def places_autocomplete(
             if strict_label in seen_labels:
                 continue
             seen_labels.add(strict_label)
-
             strict_items.append(
                 AutocompleteLiteItem(
-                    description=strict_label,  # <<— YA VIENE BIEN FORMADA
+                    description=strict_label,
                     place_id=p.get("place_id", ""),
                     types=p.get("types", []) or [],
                 )
@@ -723,7 +772,20 @@ async def places_autocomplete(
             if len(strict_items) >= limit:
                 break
 
-        return AutocompleteLiteResponse(predictions=strict_items, session_token=stoken)
+        # Si no alcanzamos, generar sugerencias “sembradas” válidas
+        if len(strict_items) < limit:
+            fallback_items = await _fallback_address_suggestions(
+                client=client,
+                base_input=input,
+                stoken=stoken,
+                language=language,
+                comps=comps,
+                limit=limit - len(strict_items),
+            )
+            strict_items.extend(fallback_items)
+
+        # Devuelve hasta `limit` (sin error); el front puede mostrar un aviso suave si quieres
+        return AutocompleteLiteResponse(predictions=strict_items[:limit], session_token=stoken)
 
 @router.get("/places/coverage-details", response_model=CoverageDetailsResponse)
 async def coverage_details(
@@ -733,26 +795,12 @@ async def coverage_details(
     language: str = Query("es", description="Idioma para Distance Matrix"),
     delivery_time_iso: Optional[str] = Query(None, description="Hora de entrega ISO-8601 (UTC), opcional para Shipday")
 ):
-    """
-    Devuelve costos/distancias y, si Shipday responde, también:
-    - pickup_duration_minutes (desde pickupDuration)
-    - delivery_duration_minutes (desde deliveryDuration)
-    - pickup_time_iso (desde pickupTime)
-    - delivery_time_iso (desde deliveryTime)
-
-    NOTA: Es OBLIGATORIO que las direcciones estén en formato
-    ST_NUM ST_NAME, CITY, STATE ZIP, COUNTRY.
-    """
     async with httpx.AsyncClient() as client:
         dlat, dlng, formatted, comps = await places_details_with_components(client, place_id, session_token)
 
-        # Construimos Address del dropoff desde Google
         address, _ = _build_address_from_components(comps)
-
-        # Validación estricta del dropoff
         drop_errs = _validate_address_required(address)
         if drop_errs:
-            # Responder de forma controlada (no 500) para que el front pueda guiar al usuario
             return CoverageDetailsResponse(
                 place_id=place_id,
                 formatted_address=formatted,
@@ -779,7 +827,6 @@ async def coverage_details(
 
         dropoff = Dropoff(address=address)
 
-        # Sede más cercana
         near = nearest_site_for(dlat, dlng, radius_miles=coverage_radius_miles)
         if not near.in_coverage:
             return CoverageDetailsResponse(
@@ -798,7 +845,6 @@ async def coverage_details(
                 error=make_out_of_coverage_error_by_city(address.city),
             )
 
-        # Distancia por carretera (si falla, usamos Haversine)
         s = near.site["location"]
         try:
             driving_miles, _ = await driving_distance_miles(client, s["lat"], s["long"], dlat, dlng, language=language)
@@ -809,9 +855,8 @@ async def coverage_details(
 
         distance_miles_report = round(float(d_miles), DISTANCE_REPORT_DECIMALS)
 
-        # Formato estricto para Shipday (pickup y delivery)
-        pickup_addr_str   = _site_pickup_address_str(near.site)    # valida y formatea
-        delivery_addr_str = _address_to_str(address)               # "ST_NUM ST_NAME, CITY, STATE ZIP, COUNTRY"
+        pickup_addr_str   = _site_pickup_address_str(near.site)
+        delivery_addr_str = _address_to_str(address)
 
         sd = await shipday_quote_fee_by_address(
             client,
@@ -863,7 +908,7 @@ async def places_details_endpoint(
 @router.post("/distance", response_model=DistanceResponse)
 async def compute_distance(
     body: DistanceRequest,
-    method: str = Query("driving", regex=r"^(haversine|driving)$")  # usar 'regex' por compatibilidad
+    method: str = Query("driving", regex=r"^(haversine|driving)$")
 ):
     async with httpx.AsyncClient() as client:
         if body.origin_place_id:
