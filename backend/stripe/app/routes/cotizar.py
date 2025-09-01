@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from fastapi import HTTPException, APIRouter, Query
 from pydantic import BaseModel, Field
 from typing import Tuple, List, Optional, Dict, Any
@@ -8,6 +10,7 @@ import re
 
 load_dotenv()
 
+# ─────────── Config / Constantes externas ───────────
 GOOGLE_API_KEY = os.getenv("GOOGLE_MAPS_API_KEY")
 if not GOOGLE_API_KEY:
     print("⚠️  Falta GOOGLE_MAPS_API_KEY en el entorno (.env)")
@@ -25,9 +28,10 @@ SHIPDAY_AVAILABILITY_URL = "https://api.shipday.com/on-demand/availability"
 
 # Fallback si Shipday no devuelve tarifa (USD por milla)
 DELIVERY_RATE_USD_PER_MILE = float(os.getenv("DELIVERY_RATE_USD_PER_MILE", "1.5"))
-
 # Decimales para reportar distancia
 DISTANCE_REPORT_DECIMALS = int(os.getenv("DISTANCE_REPORT_DECIMALS", "2"))
+# Países permitidos para Places
+PLACES_COUNTRIES = os.getenv("PLACES_COUNTRIES", "us")  # p.ej. "us" o "us|pr"
 
 router = APIRouter()
 
@@ -85,33 +89,6 @@ SEDES: List[Dict[str, Any]] = [
         },
     },
 ]
-
-PLACES_COUNTRIES = os.getenv("PLACES_COUNTRIES", "us")  # p.ej. "us" o "us|pr"
-
-def _components_for(countries: Optional[str] = None) -> Optional[str]:
-    """
-    Convierte 'us|pr' o 'usa, puerto-rico' -> 'country:us|country:pr'
-    Filtra y normaliza a ISO-3166-1 alpha-2.
-    """
-    countries = countries or PLACES_COUNTRIES
-    raw = [t.strip().lower() for t in re.split(r"[,\| ]+", countries) if t.strip()]
-
-    alias = {
-        "usa": "us", "u.s.a.": "us", "u.s.": "us", "eeuu": "us",
-        "estados-unidos": "us", "estadosunidos": "us",
-        "puerto-rico": "pr", "puertorico": "pr",
-    }
-
-    norm: List[str] = []
-    for t in raw:
-        t = alias.get(t, t)
-        if re.fullmatch(r"[a-z]{2}", t):  # solo alpha-2
-            norm.append(t)
-
-    norm = list(dict.fromkeys(norm))
-    if not norm:
-        return None
-    return "|".join(f"country:{c}" for c in norm)
 
 # ─────────── Modelos ───────────
 
@@ -189,7 +166,112 @@ class ShipdayAvailability(BaseModel):
     pickup_time_iso: Optional[str] = None
     delivery_time_iso: Optional[str] = None
 
-# ─────────── Utilidades ───────────
+# ─────────── Utilidades generales ───────────
+
+HOUSE_NUM_SEEDS = [100, 200, 500, 800, 1000, 1500, 2000, 2100, 2500]
+STREET_SUFFIXES = ["Ave", "Avenue", "St", "Street", "Rd", "Road", "Blvd", "Lane", "Dr"]
+
+def _normalize_spaces(txt: str) -> str:
+    return re.sub(r"\s+", " ", txt or "").strip()
+
+def _looks_like_street_only(user_input: str) -> bool:
+    s = _normalize_spaces(user_input)
+    if not s or any(ch.isdigit() for ch in s):
+        return False
+    words = s.split()
+    return len(words) <= 3
+
+def _ensure_route_phrase(base_input: str) -> List[str]:
+    s = _normalize_spaces(base_input)
+    if not s:
+        return []
+    title = s.title()
+    if any(re.search(rf"\b{sf}\b", title, flags=re.I) for sf in STREET_SUFFIXES):
+        return [title]
+    variants = [f"{title} {sf}" for sf in ["Ave", "St", "Road", "Blvd"]]
+    seen, out = set(), []
+    for v in variants:
+        if v.lower() not in seen:
+            seen.add(v.lower())
+            out.append(v)
+    return out
+
+def _cities_from_sedes() -> List[Dict[str, str]]:
+    seen = set()
+    out: List[Dict[str, str]] = []
+    for s in SEDES:
+        addr = (s.get("pickup") or {}).get("address") or {}
+        city = (addr.get("city") or "").strip()
+        state = (addr.get("state") or "").strip()
+        if city and state:
+            key = f"{city}|{state}"
+            if key not in seen:
+                seen.add(key)
+                out.append({"city": city, "state": state})
+    if not out:
+        out = [{"city": "Union City", "state": "NJ"},
+               {"city": "Newark", "state": "NJ"},
+               {"city": "Philadelphia", "state": "PA"}]
+    return out
+
+def _city_center(city: str, state: str) -> Optional[Tuple[float, float]]:
+    for s in SEDES:
+        a = (s.get("pickup") or {}).get("address") or {}
+        if (a.get("city") or "").lower() == city.lower() and (a.get("state") or "").upper() == state.upper():
+            loc = s.get("location") or {}
+            if "lat" in loc and "long" in loc:
+                return float(loc["lat"]), float(loc["long"])
+    return None
+
+def _join_nonempty(parts: List[str], sep: str = ", ") -> str:
+    return sep.join([p for p in parts if p and str(p).strip()])
+
+_STREET_RE = re.compile(r"^\s*(\d+)\s+(.+?)\s*$")  # exige número y nombre de vía
+
+def _validate_address_required(addr: Address) -> List[str]:
+    errors: List[str] = []
+    if not addr.street or not _STREET_RE.match(addr.street):
+        errors.append("street (debe incluir número y nombre de vía)")
+    if not addr.city:
+        errors.append("city")
+    if not addr.state:
+        errors.append("state")
+    if not addr.zip:
+        errors.append("zip")
+    if not addr.country:
+        errors.append("country (ISO-2)")
+    return errors
+
+def _format_address_strict(addr: Address) -> str:
+    errs = _validate_address_required(addr)
+    if errs:
+        raise ValueError(", ".join(errs))
+    line2 = " ".join([p for p in [addr.state, addr.zip] if p])
+    return ", ".join([addr.street, addr.city, line2, addr.country])
+
+def _address_to_str(addr: Address) -> str:
+    return _format_address_strict(addr)
+
+def _site_pickup_address_str(site: Dict[str, Any]) -> str:
+    pickup_addr = (site.get("pickup") or {}).get("address") or {}
+    if not pickup_addr:
+        raise HTTPException(status_code=500, detail=f"sede '{site.get('site_name')}' sin pickup.address configurado")
+
+    addr = Address(
+        unit=pickup_addr.get("unit"),
+        street=pickup_addr.get("street", ""),
+        city=pickup_addr.get("city", ""),
+        state=pickup_addr.get("state", ""),
+        zip=pickup_addr.get("zip", ""),
+        country=pickup_addr.get("country", ""),
+    )
+    try:
+        return _format_address_strict(addr)
+    except ValueError as ve:
+        raise HTTPException(
+            status_code=500,
+            detail=f"sede '{site.get('site_name')}' pickup misconfigured: faltan campos -> {str(ve)}"
+        )
 
 def haversine_miles(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     R_miles = 3958.7613
@@ -221,57 +303,28 @@ def make_out_of_coverage_error_by_city(city: str) -> CoverageError:
         message_en=f"No coverage in {city_txt}. We don't have locations in that city yet.",
     )
 
-# === Validación estricta de direcciones ===
+# ─────────── Google APIs ───────────
 
-_STREET_RE = re.compile(r"^\s*(\d+)\s+(.+?)\s*$")  # exige número y nombre de vía
+def _components_for(countries: Optional[str] = None) -> Optional[str]:
+    countries = countries or PLACES_COUNTRIES
+    raw = [t.strip().lower() for t in re.split(r"[,\| ]+", countries) if t.strip()]
 
-def _validate_address_required(addr: "Address") -> List[str]:
-    errors: List[str] = []
-    if not addr.street or not _STREET_RE.match(addr.street):
-        errors.append("street (debe incluir número y nombre de vía)")
-    if not addr.city:
-        errors.append("city")
-    if not addr.state:
-        errors.append("state")
-    if not addr.zip:
-        errors.append("zip")
-    if not addr.country:
-        errors.append("country (ISO-2)")
-    return errors
+    alias = {
+        "usa": "us", "u.s.a.": "us", "u.s.": "us", "eeuu": "us",
+        "estados-unidos": "us", "estadosunidos": "us",
+        "puerto-rico": "pr", "puertorico": "pr",
+    }
 
-def _format_address_strict(addr: "Address") -> str:
-    errs = _validate_address_required(addr)
-    if errs:
-        raise ValueError(", ".join(errs))
-    line2 = " ".join([p for p in [addr.state, addr.zip] if p])
-    return ", ".join([addr.street, addr.city, line2, addr.country])
+    norm: List[str] = []
+    for t in raw:
+        t = alias.get(t, t)
+        if re.fullmatch(r"[a-z]{2}", t):
+            norm.append(t)
 
-def _join_nonempty(parts: List[str], sep: str = ", ") -> str:
-    return sep.join([p for p in parts if p and str(p).strip()])
-
-def _site_pickup_address_str(site: Dict[str, Any]) -> str:
-    pickup_addr = (site.get("pickup") or {}).get("address") or {}
-    if not pickup_addr:
-        raise HTTPException(status_code=500, detail=f"sede '{site.get('site_name')}' sin pickup.address configurado")
-
-    addr = Address(
-        unit=pickup_addr.get("unit"),
-        street=pickup_addr.get("street", ""),
-        city=pickup_addr.get("city", ""),
-        state=pickup_addr.get("state", ""),
-        zip=pickup_addr.get("zip", ""),
-        country=pickup_addr.get("country", ""),
-    )
-    try:
-        return _format_address_strict(addr)
-    except ValueError as ve:
-        raise HTTPException(
-            status_code=500,
-            detail=f"sede '{site.get('site_name')}' pickup misconfigured: faltan campos -> {str(ve)}"
-        )
-
-def _address_to_str(addr: "Address") -> str:
-    return _format_address_strict(addr)
+    norm = list(dict.fromkeys(norm))
+    if not norm:
+        return None
+    return "|".join(f"country:{c}" for c in norm)
 
 async def geocode_address(client: httpx.AsyncClient, address: str) -> Tuple[float, float, str]:
     if not GOOGLE_API_KEY:
@@ -345,46 +398,6 @@ async def places_details_with_components(
     comps = res.get("address_components", []) or []
     return float(loc["lat"]), float(loc["lng"]), (formatted or place_id), comps
 
-def _find_component(comps: List[Dict[str, Any]], type_name: str, short: bool = True) -> str:
-    for c in comps:
-        if type_name in (c.get("types") or []):
-            return c.get("short_name") if short and c.get("short_name") else c.get("long_name", "")
-    return ""
-
-def _build_address_from_components(comps: List[Dict[str, Any]]) -> Tuple[Address, str]:
-    street_number = _find_component(comps, "street_number", short=False)
-    route = _find_component(comps, "route", short=False)
-    street = f"{street_number} {route}".strip() if (street_number or route) else ""
-
-    city = (
-        _find_component(comps, "locality", short=False)
-        or _find_component(comps, "sublocality", short=False)
-        or _find_component(comps, "administrative_area_level_2", short=False)
-        or ""
-    )
-
-    state = _find_component(comps, "administrative_area_level_1", short=True) or ""
-    zip_code = _find_component(comps, "postal_code", short=False) or ""
-    country = _find_component(comps, "country", short=True) or ""  # ISO-2
-    unit = _find_component(comps, "subpremise", short=False) or None
-
-    street = re.sub(r"\s+", " ", street).strip()
-    city = re.sub(r"\s+", " ", city).strip()
-
-    addr = Address(
-        unit=unit,
-        street=street,
-        city=city,
-        state=state,
-        zip=zip_code,
-        country=country
-    )
-
-    raw_address = ", ".join(
-        filter(None, [street_number, route, city, state, zip_code, country])
-    )
-    return addr, raw_address
-
 async def driving_distance_miles(
     client: httpx.AsyncClient,
     o_lat: float, o_lng: float,
@@ -420,6 +433,8 @@ async def driving_distance_miles(
     miles   = meters / 1609.344
     return float(miles), int(seconds)
 
+# ─────────── Shipday helpers ───────────
+
 SHIPDAY_PREFERRED_PROVIDER = os.getenv("SHIPDAY_PREFERRED_PROVIDER", "uber").strip().lower()
 
 def _shipday_auth_value() -> str:
@@ -429,9 +444,7 @@ def _shipday_auth_value() -> str:
     return key if key.lower().startswith("basic ") else f"Basic {key}"
 
 def _as_int(val: Any) -> Optional[int]:
-    if val is None:
-        return None
-    if isinstance(val, bool):
+    if val is None or isinstance(val, bool):
         return None
     if isinstance(val, (int, float)):
         return int(val)
@@ -521,7 +534,7 @@ async def shipday_quote_fee_by_address(
 
     return best
 
-# (Versión por coordenadas para compatibilidad)
+# Versión por coordenadas (compat)
 async def shipday_quote_fee(
     client: httpx.AsyncClient,
     pickup_lat: float, pickup_lng: float,
@@ -591,13 +604,17 @@ async def shipday_quote_fee(
 
     return min(uber_fees) if uber_fees else None
 
-# ─────────── Helpers de Autocomplete ───────────
+# ─────────── Helpers Autocomplete ───────────
 
 async def _strict_label_from_place(
     client: httpx.AsyncClient,
     place_id: str,
     session_token: Optional[str]
 ) -> Optional[Tuple[Address, str]]:
+    """
+    Valida con Place Details y construye una etiqueta estricta (NUM STREET, CITY, ST ZIP, COUNTRY).
+    Devuelve (Address, label) solo si tiene número, ciudad, estado, zip y país.
+    """
     try:
         _lat, _lng, _formatted, comps = await places_details_with_components(
             client, place_id, session_token
@@ -606,7 +623,7 @@ async def _strict_label_from_place(
         errs = _validate_address_required(addr)
         if errs:
             return None
-        label = _address_to_str(addr)  # "NUM STREET, CITY, ST ZIP, COUNTRY"
+        label = _address_to_str(addr)
         return addr, label
     except Exception:
         return None
@@ -619,6 +636,46 @@ FALLBACK_STREETS_US = [
     "Center St", "High St", "Elm St"
 ]
 
+def _find_component(comps: List[Dict[str, Any]], type_name: str, short: bool = True) -> str:
+    for c in comps:
+        if type_name in (c.get("types") or []):
+            return c.get("short_name") if short and c.get("short_name") else c.get("long_name", "")
+    return ""
+
+def _build_address_from_components(comps: List[Dict[str, Any]]) -> Tuple[Address, str]:
+    street_number = _find_component(comps, "street_number", short=False)
+    route = _find_component(comps, "route", short=False)
+    street = f"{street_number} {route}".strip() if (street_number or route) else ""
+
+    city = (
+        _find_component(comps, "locality", short=False)
+        or _find_component(comps, "sublocality", short=False)
+        or _find_component(comps, "administrative_area_level_2", short=False)
+        or ""
+    )
+
+    state = _find_component(comps, "administrative_area_level_1", short=True) or ""
+    zip_code = _find_component(comps, "postal_code", short=False) or ""
+    country = _find_component(comps, "country", short=True) or ""  # ISO-2
+    unit = _find_component(comps, "subpremise", short=False) or None
+
+    street = re.sub(r"\s+", " ", street).strip()
+    city = re.sub(r"\s+", " ", city).strip()
+
+    addr = Address(
+        unit=unit,
+        street=street,
+        city=city,
+        state=state,
+        zip=zip_code,
+        country=country
+    )
+
+    raw_address = ", ".join(
+        filter(None, [street_number, route, city, state, zip_code, country])
+    )
+    return addr, raw_address
+
 async def _fallback_address_suggestions(
     client: httpx.AsyncClient,
     base_input: str,
@@ -627,66 +684,77 @@ async def _fallback_address_suggestions(
     comps: Optional[str],
     limit: int
 ) -> List[AutocompleteLiteItem]:
-    """
-    Si no hay suficientes direcciones estrictas, genera consultas “sembradas”
-    como '<input> Main St' y valida resultados hasta completar `limit`.
-    """
     results: List[AutocompleteLiteItem] = []
     seen_place_ids: set = set()
     seen_labels: set = set()
 
-    # Intento 1: usar varias calles frecuentes en USA
-    for street in FALLBACK_STREETS_US:
+    route_candidates = _ensure_route_phrase(base_input) if _looks_like_street_only(base_input) else [base_input.title()]
+    city_seeds = _cities_from_sedes()
+
+    for city_item in city_seeds:
         if len(results) >= limit:
             break
-        aug = f"{base_input} {street}".strip()
-        params = {
-            "input": aug,
-            "key": GOOGLE_API_KEY,
-            "language": language,
-            "sessiontoken": stoken,
-            "types": "address",
-        }
-        if comps:
-            params["components"] = comps
+        city = city_item["city"]
+        state = city_item["state"]
+        bias = _city_center(city, state)
+        locationbias = f"circle:25000@{bias[0]},{bias[1]}" if bias else None  # ~25km
 
-        try:
-            resp = await client.get(PLACES_AUTOCOMPLETE_URL, params=params, timeout=10.0)
-            if resp.status_code != 200:
-                continue
-            data = resp.json()
-            if data.get("status") != "OK":
-                continue
-            preds = (data.get("predictions") or [])[:5]
-        except Exception:
-            continue
-
-        # Validar cada candidata con Place Details
-        tasks = [
-            _strict_label_from_place(client, p.get("place_id", ""), stoken)
-            for p in preds if p.get("place_id")
-        ]
-        details = await asyncio.gather(*tasks, return_exceptions=True)
-
-        for p, det in zip(preds, details):
-            if isinstance(det, Exception) or not det:
-                continue
-            _addr, label = det
-            pid = p.get("place_id", "")
-            if not pid or pid in seen_place_ids or label in seen_labels:
-                continue
-            seen_place_ids.add(pid)
-            seen_labels.add(label)
-            results.append(
-                AutocompleteLiteItem(
-                    description=label,
-                    place_id=pid,
-                    types=p.get("types", []) or [],
-                )
-            )
+        for route in route_candidates:
             if len(results) >= limit:
                 break
 
+            for num in HOUSE_NUM_SEEDS:
+                if len(results) >= limit:
+                    break
+                query = f"{num} {route}, {city}, {state}"
+
+                params = {
+                    "input": query,
+                    "key": GOOGLE_API_KEY,
+                    "language": language,
+                    "sessiontoken": stoken,
+                    "types": "address",
+                }
+                if comps:
+                    params["components"] = comps
+                if locationbias:
+                    params["locationbias"] = locationbias
+
+                try:
+                    resp = await client.get(PLACES_AUTOCOMPLETE_URL, params=params, timeout=8.0)
+                    if resp.status_code != 200:
+                        continue
+                    data = resp.json()
+                    if data.get("status") != "OK":
+                        continue
+                    preds = (data.get("predictions") or [])[:3]
+                except Exception:
+                    continue
+
+                tasks = [
+                    _strict_label_from_place(client, p.get("place_id", ""), stoken)
+                    for p in preds if p.get("place_id")
+                ]
+                details = await asyncio.gather(*tasks, return_exceptions=True)
+
+                for p, det in zip(preds, details):
+                    if isinstance(det, Exception) or not det:
+                        continue
+                    _addr, label = det
+                    pid = p.get("place_id", "")
+                    if not pid or pid in seen_place_ids or label in seen_labels:
+                        continue
+                    seen_place_ids.add(pid)
+                    seen_labels.add(label)
+                    results.append(
+                        AutocompleteLiteItem(
+                            description=label,
+                            place_id=pid,
+                            types=p.get("types", []) or [],
+                        )
+                    )
+                    if len(results) >= limit:
+                        break
     return results
 
 # ─────────── Endpoints ───────────
@@ -706,7 +774,6 @@ async def places_autocomplete(
     stoken = session_token or str(uuid.uuid4())
     comps = _components_for(countries)
 
-    # Pedimos más de lo necesario para poder filtrar
     oversample_factor = 3
     fetch_n = min(20, max(limit, limit * oversample_factor))
 
@@ -734,7 +801,6 @@ async def places_autocomplete(
 
         raw_preds = (data.get("predictions") or [])[:fetch_n]
 
-        # Modo no estricto → devolver tal cual (para debug/manual)
         if not strict:
             items = [
                 AutocompleteLiteItem(
@@ -746,7 +812,6 @@ async def places_autocomplete(
             ]
             return AutocompleteLiteResponse(predictions=items, session_token=stoken)
 
-        # Estricto: validar con Place Details en paralelo
         tasks = [
             _strict_label_from_place(client, p.get("place_id", ""), stoken)
             for p in raw_preds if p.get("place_id")
@@ -772,7 +837,6 @@ async def places_autocomplete(
             if len(strict_items) >= limit:
                 break
 
-        # Si no alcanzamos, generar sugerencias “sembradas” válidas
         if len(strict_items) < limit:
             fallback_items = await _fallback_address_suggestions(
                 client=client,
@@ -784,8 +848,16 @@ async def places_autocomplete(
             )
             strict_items.extend(fallback_items)
 
-        # Devuelve hasta `limit` (sin error); el front puede mostrar un aviso suave si quieres
         return AutocompleteLiteResponse(predictions=strict_items[:limit], session_token=stoken)
+
+@router.get("/places/details", response_model=GeocodedPoint)
+async def places_details_endpoint(
+    place_id: str = Query(..., description="Place ID a resolver"),
+    session_token: Optional[str] = Query(None, description="Token de sesión usado en Autocomplete")
+):
+    async with httpx.AsyncClient() as client:
+        lat, lng, formatted = await places_details(client, place_id, session_token)
+    return GeocodedPoint(query=place_id, formatted_address=formatted, lat=lat, lng=lng)
 
 @router.get("/places/coverage-details", response_model=CoverageDetailsResponse)
 async def coverage_details(
@@ -868,14 +940,14 @@ async def coverage_details(
         pickup_duration_minutes: Optional[int] = None
         delivery_duration_minutes: Optional[int] = None
         pickup_time_iso: Optional[str] = None
-        delivery_time_iso: Optional[str] = None
+        delivery_time_iso_out: Optional[str] = None
 
         if isinstance(sd, ShipdayAvailability):
             cost_int = int(math.ceil(float(sd.fee)))  # USD (nombre compat)
             pickup_duration_minutes = sd.pickup_duration_minutes
             delivery_duration_minutes = sd.delivery_duration_minutes
             pickup_time_iso = sd.pickup_time_iso
-            delivery_time_iso = sd.delivery_time_iso
+            delivery_time_iso_out = sd.delivery_time_iso
         else:
             miles_for_cost = near.driving_distance_miles or d_miles
             cost_int = int(math.ceil(max(round(miles_for_cost * DELIVERY_RATE_USD_PER_MILE, 2), DELIVERY_RATE_USD_PER_MILE)))
@@ -892,23 +964,14 @@ async def coverage_details(
         pickup_duration_minutes=pickup_duration_minutes,
         delivery_duration_minutes=delivery_duration_minutes,
         pickup_time_iso=pickup_time_iso,
-        delivery_time_iso=delivery_time_iso,
+        delivery_time_iso=delivery_time_iso_out,
         error=None
     )
-
-@router.get("/places/details", response_model=GeocodedPoint)
-async def places_details_endpoint(
-    place_id: str = Query(..., description="Place ID a resolver"),
-    session_token: Optional[str] = Query(None, description="Token de sesión usado en Autocomplete")
-):
-    async with httpx.AsyncClient() as client:
-        lat, lng, formatted = await places_details(client, place_id, session_token)
-    return GeocodedPoint(query=place_id, formatted_address=formatted, lat=lat, lng=lng)
 
 @router.post("/distance", response_model=DistanceResponse)
 async def compute_distance(
     body: DistanceRequest,
-    method: str = Query("driving", regex=r"^(haversine|driving)$")
+    method: str = Query("driving", pattern=r"^(haversine|driving)$")
 ):
     async with httpx.AsyncClient() as client:
         if body.origin_place_id:
