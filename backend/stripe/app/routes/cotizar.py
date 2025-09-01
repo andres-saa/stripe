@@ -86,7 +86,33 @@ SEDES: List[Dict[str, Any]] = [
     },
 ]
 
-PLACES_COUNTRIES = os.getenv("PLACES_COUNTRIES", "us")  # p.ej. "us" o "us|pr"
+PLACES_COUNTRIES = os.getenv("PLACES_COUNTRIES", "us")  # p.ej. "us" o "us|pr"\
+
+
+
+
+async def _strict_label_from_place(
+    client: httpx.AsyncClient,
+    place_id: str,
+    session_token: Optional[str]
+) -> Optional[Tuple[Address, str]]:
+    """
+    Devuelve (Address, 'ST_NUM ST_NAME, CITY, ST ZIP, COUNTRY') si el place_id
+    es una dirección completa; en caso contrario, None.
+    """
+    try:
+        _lat, _lng, _formatted, comps = await places_details_with_components(
+            client, place_id, session_token
+        )
+        addr, _raw = _build_address_from_components(comps)
+        errs = _validate_address_required(addr)
+        if errs:
+            return None
+        # Cadena estricta (lanza si faltara algo, pero ya validamos arriba)
+        label = _address_to_str(addr)
+        return addr, label
+    except Exception:
+        return None
 
 def _components_for(countries: Optional[str] = None) -> Optional[str]:
     """
@@ -616,6 +642,27 @@ async def shipday_quote_fee(
     return min(uber_fees) if uber_fees else None
 
 # ─────────── Endpoints ───────────
+# ─────────── Helper: valida y arma etiqueta estricta ───────────
+async def _strict_label_from_place(
+    client: httpx.AsyncClient,
+    place_id: str,
+    session_token: Optional[str]
+) -> Optional[Tuple[Address, str]]:
+    try:
+        _lat, _lng, _formatted, comps = await places_details_with_components(
+            client, place_id, session_token
+        )
+        addr, _raw = _build_address_from_components(comps)
+        errs = _validate_address_required(addr)
+        if errs:
+            return None
+        label = _address_to_str(addr)  # "NUM STREET, CITY, ST ZIP, COUNTRY"
+        return addr, label
+    except Exception:
+        return None
+
+
+# ─────────── Autocomplete ESTRICTO: solo direcciones válidas ───────────
 @router.get("/places/autocomplete", response_model=AutocompleteLiteResponse)
 async def places_autocomplete(
     input: str = Query(..., min_length=1, description="Texto parcial de dirección"),
@@ -631,7 +678,7 @@ async def places_autocomplete(
     stoken = session_token or str(uuid.uuid4())
     comps = _components_for(countries)
 
-    # Para tener suficientes candidatas válidas, pedimos más de las necesarias.
+    # Pedimos más de lo necesario para poder filtrar (sin dejar al usuario sin opciones)
     oversample_factor = 3
     fetch_n = min(20, max(limit, limit * oversample_factor))
 
@@ -640,7 +687,7 @@ async def places_autocomplete(
         "key": GOOGLE_API_KEY,
         "language": language,
         "sessiontoken": stoken,
-        "types": "address",  # sesgo fuerte a direcciones
+        "types": "address",
     }
     if comps:
         params["components"] = comps
@@ -662,9 +709,8 @@ async def places_autocomplete(
 
         raw_preds = (data.get("predictions") or [])[:fetch_n]
 
-        # Si no exigimos estricto, devolvemos como venía (pero con límite)
         if not strict:
-            items: List[AutocompleteLiteItem] = [
+            items = [
                 AutocompleteLiteItem(
                     description=p.get("description", ""),
                     place_id=p.get("place_id", ""),
@@ -674,24 +720,28 @@ async def places_autocomplete(
             ]
             return AutocompleteLiteResponse(predictions=items, session_token=stoken)
 
-        # Estricto: verificamos cada candidate con Place Details y filtramos.
-        # Hacemos las llamadas en paralelo para mejor latencia.
+        # Estricto: validamos cada candidate con Place Details (en paralelo)
         tasks = [
             _strict_label_from_place(client, p.get("place_id", ""), stoken)
-            for p in raw_preds
-            if p.get("place_id")
+            for p in raw_preds if p.get("place_id")
         ]
         details_results = await asyncio.gather(*tasks, return_exceptions=True)
 
         strict_items: List[AutocompleteLiteItem] = []
+        seen_labels = set()
+
         for p, det in zip(raw_preds, details_results):
             if isinstance(det, Exception) or not det:
                 continue
             _addr, strict_label = det
+            # Evitar duplicados exactos por si Google repite variantes
+            if strict_label in seen_labels:
+                continue
+            seen_labels.add(strict_label)
+
             strict_items.append(
                 AutocompleteLiteItem(
-                    # Mostramos la forma estricta; así el usuario solo ve opciones válidas
-                    description=strict_label,
+                    description=strict_label,                 # <<— YA VIENE BIEN FORMADA
                     place_id=p.get("place_id", ""),
                     types=p.get("types", []) or [],
                 )
@@ -699,7 +749,6 @@ async def places_autocomplete(
             if len(strict_items) >= limit:
                 break
 
-        # Si no conseguimos suficientes, devolvemos las que haya (posible 0)
         return AutocompleteLiteResponse(predictions=strict_items, session_token=stoken)
 
 
@@ -830,29 +879,6 @@ async def coverage_details(
     )
 
 
-
-async def _strict_label_from_place(
-    client: httpx.AsyncClient,
-    place_id: str,
-    session_token: Optional[str]
-) -> Optional[Tuple[Address, str]]:
-    """
-    Devuelve (Address, 'ST_NUM ST_NAME, CITY, ST ZIP, COUNTRY') si el place_id
-    es una dirección completa; en caso contrario, None.
-    """
-    try:
-        _lat, _lng, _formatted, comps = await places_details_with_components(
-            client, place_id, session_token
-        )
-        addr, _raw = _build_address_from_components(comps)
-        errs = _validate_address_required(addr)
-        if errs:
-            return None
-        # Cadena estricta (lanza si faltara algo, pero ya validamos arriba)
-        label = _address_to_str(addr)
-        return addr, label
-    except Exception:
-        return None
 
 
 @router.get("/places/details", response_model=GeocodedPoint)
