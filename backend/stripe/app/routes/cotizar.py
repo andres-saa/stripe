@@ -616,7 +616,6 @@ async def shipday_quote_fee(
     return min(uber_fees) if uber_fees else None
 
 # ─────────── Endpoints ───────────
-
 @router.get("/places/autocomplete", response_model=AutocompleteLiteResponse)
 async def places_autocomplete(
     input: str = Query(..., min_length=1, description="Texto parcial de dirección"),
@@ -624,6 +623,7 @@ async def places_autocomplete(
     language: str = Query("es", description="Idioma de resultados"),
     countries: Optional[str] = Query(None, description="Códigos ISO-3166-1 alpha-2 separados por | o , (p.ej. 'us|pr')"),
     limit: int = Query(5, ge=1, le=10, description="Máximo de sugerencias"),
+    strict: bool = Query(True, description="Solo sugerencias bien formadas (número, calle, ciudad, estado, ZIP, país)")
 ):
     if not GOOGLE_API_KEY:
         raise HTTPException(status_code=500, detail="No se configuró GOOGLE_MAPS_API_KEY")
@@ -631,12 +631,16 @@ async def places_autocomplete(
     stoken = session_token or str(uuid.uuid4())
     comps = _components_for(countries)
 
+    # Para tener suficientes candidatas válidas, pedimos más de las necesarias.
+    oversample_factor = 3
+    fetch_n = min(20, max(limit, limit * oversample_factor))
+
     params = {
         "input": input,
         "key": GOOGLE_API_KEY,
         "language": language,
         "sessiontoken": stoken,
-        "types": "address",
+        "types": "address",  # sesgo fuerte a direcciones
     }
     if comps:
         params["components"] = comps
@@ -656,17 +660,48 @@ async def places_autocomplete(
             msg = data.get("error_message") or status or "Error en Autocomplete"
             raise HTTPException(status_code=400, detail=msg)
 
-        raw_preds = data.get("predictions", [])[:limit]
-        items: List[AutocompleteLiteItem] = [
-            AutocompleteLiteItem(
-                description=p.get("description", ""),
-                place_id=p.get("place_id", ""),
-                types=p.get("types", []) or [],
-            )
-            for p in raw_preds
-        ]
+        raw_preds = (data.get("predictions") or [])[:fetch_n]
 
-    return AutocompleteLiteResponse(predictions=items, session_token=stoken)
+        # Si no exigimos estricto, devolvemos como venía (pero con límite)
+        if not strict:
+            items: List[AutocompleteLiteItem] = [
+                AutocompleteLiteItem(
+                    description=p.get("description", ""),
+                    place_id=p.get("place_id", ""),
+                    types=p.get("types", []) or [],
+                )
+                for p in raw_preds[:limit]
+            ]
+            return AutocompleteLiteResponse(predictions=items, session_token=stoken)
+
+        # Estricto: verificamos cada candidate con Place Details y filtramos.
+        # Hacemos las llamadas en paralelo para mejor latencia.
+        tasks = [
+            _strict_label_from_place(client, p.get("place_id", ""), stoken)
+            for p in raw_preds
+            if p.get("place_id")
+        ]
+        details_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        strict_items: List[AutocompleteLiteItem] = []
+        for p, det in zip(raw_preds, details_results):
+            if isinstance(det, Exception) or not det:
+                continue
+            _addr, strict_label = det
+            strict_items.append(
+                AutocompleteLiteItem(
+                    # Mostramos la forma estricta; así el usuario solo ve opciones válidas
+                    description=strict_label,
+                    place_id=p.get("place_id", ""),
+                    types=p.get("types", []) or [],
+                )
+            )
+            if len(strict_items) >= limit:
+                break
+
+        # Si no conseguimos suficientes, devolvemos las que haya (posible 0)
+        return AutocompleteLiteResponse(predictions=strict_items, session_token=stoken)
+
 
 @router.get("/places/coverage-details", response_model=CoverageDetailsResponse)
 async def coverage_details(
@@ -793,6 +828,32 @@ async def coverage_details(
         delivery_time_iso=delivery_time_iso,
         error=None
     )
+
+
+
+async def _strict_label_from_place(
+    client: httpx.AsyncClient,
+    place_id: str,
+    session_token: Optional[str]
+) -> Optional[Tuple[Address, str]]:
+    """
+    Devuelve (Address, 'ST_NUM ST_NAME, CITY, ST ZIP, COUNTRY') si el place_id
+    es una dirección completa; en caso contrario, None.
+    """
+    try:
+        _lat, _lng, _formatted, comps = await places_details_with_components(
+            client, place_id, session_token
+        )
+        addr, _raw = _build_address_from_components(comps)
+        errs = _validate_address_required(addr)
+        if errs:
+            return None
+        # Cadena estricta (lanza si faltara algo, pero ya validamos arriba)
+        label = _address_to_str(addr)
+        return addr, label
+    except Exception:
+        return None
+
 
 @router.get("/places/details", response_model=GeocodedPoint)
 async def places_details_endpoint(
