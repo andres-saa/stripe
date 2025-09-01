@@ -33,7 +33,7 @@ DISTANCE_REPORT_DECIMALS = int(os.getenv("DISTANCE_REPORT_DECIMALS", "2"))
 # Países permitidos para Places
 PLACES_COUNTRIES = os.getenv("PLACES_COUNTRIES", "us")  # p.ej. "us" o "us|pr"
 # Límite de cobertura por distancia conducida (mi)
-MAX_DRIVING_DISTANCE_MILES = float(os.getenv("MAX_DRIVING_DISTANCE_MILES", "9.5"))
+MAX_DRIVING_DISTANCE_MILES = float(os.getenv("MAX_DRIVING_DISTANCE_MILES", "15"))
 
 router = APIRouter()
 
