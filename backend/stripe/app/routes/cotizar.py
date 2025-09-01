@@ -989,7 +989,7 @@ async def coverage_details(
                     ),
                     message_en=(
                         f"Out of coverage: driving distance exceeds "
-                        f"{MAX_DRIVING_DISTANCE_MILES} miles."
+                        f"{10} miles."
                     ),
                 ),
             )
