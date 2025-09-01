@@ -327,6 +327,10 @@ def _components_for(countries: Optional[str] = None) -> Optional[str]:
     return "|".join(f"country:{c}" for c in norm)
 
 async def geocode_address(client: httpx.AsyncClient, address: str) -> Tuple[float, float, str]:
+    """
+    Geocodifica y devuelve SIEMPRE una etiqueta estricta: '123 Main St, City, ST 99999, US'.
+    Falla con 400 si no se puede construir.
+    """
     if not GOOGLE_API_KEY:
         raise HTTPException(status_code=500, detail="No se configuró GOOGLE_MAPS_API_KEY")
     params = {"address": address, "key": GOOGLE_API_KEY, "components": _components_for()}
@@ -340,20 +344,28 @@ async def geocode_address(client: httpx.AsyncClient, address: str) -> Tuple[floa
         raise HTTPException(status_code=400, detail=f"No se pudo geocodificar '{address}': {msg}")
     top = data["results"][0]
     loc = top["geometry"]["location"]
-    formatted = top.get("formatted_address", address)
-    return float(loc["lat"]), float(loc["lng"]), formatted
+    comps = top.get("address_components", []) or []
+    addr, _raw = _build_address_from_components(comps)
+    errs = _validate_address_required(addr)
+    if errs:
+        raise HTTPException(status_code=400, detail=f"Dirección incompleta: faltan {', '.join(errs)}")
+    strict_label = _address_to_str(addr)
+    return float(loc["lat"]), float(loc["lng"]), strict_label
 
 async def places_details(
     client: httpx.AsyncClient,
     place_id: str,
     session_token: Optional[str] = None
 ) -> Tuple[float, float, str]:
+    """
+    Resuelve SIEMPRE etiqueta estricta a partir de address_components.
+    """
     if not GOOGLE_API_KEY:
         raise HTTPException(status_code=500, detail="No se configuró GOOGLE_MAPS_API_KEY")
     params = {
         "place_id": place_id,
         "key": GOOGLE_API_KEY,
-        "fields": "formatted_address,geometry/location"
+        "fields": "formatted_address,geometry,address_components"
     }
     if session_token:
         params["sessiontoken"] = session_token
@@ -367,8 +379,13 @@ async def places_details(
         raise HTTPException(status_code=400, detail=f"No se pudo resolver place_id '{place_id}': {msg}")
     res = data["result"]
     loc = res["geometry"]["location"]
-    formatted = res.get("formatted_address", "")
-    return float(loc["lat"]), float(loc["lng"]), formatted or place_id
+    comps = res.get("address_components", []) or []
+    addr, _raw = _build_address_from_components(comps)
+    errs = _validate_address_required(addr)
+    if errs:
+        raise HTTPException(status_code=400, detail=f"Dirección incompleta: faltan {', '.join(errs)}")
+    strict_label = _address_to_str(addr)
+    return float(loc["lat"]), float(loc["lng"]), strict_label
 
 async def places_details_with_components(
     client: httpx.AsyncClient,
@@ -394,8 +411,15 @@ async def places_details_with_components(
         raise HTTPException(status_code=400, detail=f"No se pudo resolver place_id '{place_id}': {msg}")
     res = data["result"]
     loc = res["geometry"]["location"]
-    formatted = res.get("formatted_address", "")
     comps = res.get("address_components", []) or []
+    # construir etiqueta estricta aquí también para reutilizar en coverage
+    addr, _raw = _build_address_from_components(comps)
+    errs = _validate_address_required(addr)
+    if errs:
+        # devolvemos formatted original pero ojo: los callers pueden decidir cómo manejarlo
+        formatted = res.get("formatted_address", "") or place_id
+    else:
+        formatted = _address_to_str(addr)
     return float(loc["lat"]), float(loc["lng"]), (formatted or place_id), comps
 
 async def driving_distance_miles(
@@ -875,7 +899,7 @@ async def coverage_details(
         if drop_errs:
             return CoverageDetailsResponse(
                 place_id=place_id,
-                formatted_address=formatted,
+                formatted_address=formatted,  # puede ser el formatted de Google si falló la estricta
                 lat=dlat,
                 lng=dlng,
                 nearest=None,
@@ -897,13 +921,15 @@ async def coverage_details(
                 ),
             )
 
+        # Etiqueta estricta garantizada aquí
+        strict_label = _address_to_str(address)
         dropoff = Dropoff(address=address)
 
         near = nearest_site_for(dlat, dlng, radius_miles=coverage_radius_miles)
         if not near.in_coverage:
             return CoverageDetailsResponse(
                 place_id=place_id,
-                formatted_address=formatted,
+                formatted_address=strict_label,
                 lat=dlat,
                 lng=dlng,
                 nearest=None,
@@ -928,7 +954,7 @@ async def coverage_details(
         distance_miles_report = round(float(d_miles), DISTANCE_REPORT_DECIMALS)
 
         pickup_addr_str   = _site_pickup_address_str(near.site)
-        delivery_addr_str = _address_to_str(address)
+        delivery_addr_str = strict_label  # ya en formato estricto
 
         sd = await shipday_quote_fee_by_address(
             client,
@@ -954,7 +980,7 @@ async def coverage_details(
 
     return CoverageDetailsResponse(
         place_id=place_id,
-        formatted_address=formatted,
+        formatted_address=strict_label,
         lat=dlat,
         lng=dlng,
         nearest=near,
