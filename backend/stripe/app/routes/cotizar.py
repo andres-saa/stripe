@@ -30,6 +30,8 @@ SHIPDAY_AVAILABILITY_URL = "https://api.shipday.com/on-demand/availability"
 # Fallback si Shipday no devuelve tarifa (USD por milla)
 # ⇨ Por tu pedido, dejamos 2.0 USD/milla como predeterminado.
 DELIVERY_RATE_USD_PER_MILE = float(os.getenv("DELIVERY_RATE_USD_PER_MILE", "2.0"))
+# Mínimo cuando NO hay cobertura (aplica sólo en fallback)
+DELIVERY_MIN_USD_OUT_OF_COVERAGE = float(os.getenv("DELIVERY_MIN_USD_OUT_OF_COVERAGE", "6.0"))
 
 # Decimales para reportar distancia
 DISTANCE_REPORT_DECIMALS = int(os.getenv("DISTANCE_REPORT_DECIMALS", "2"))
@@ -434,7 +436,8 @@ async def driving_distance_miles(
     language: str = "es"
 ) -> Tuple[float, int]:
     if not GOOGLE_API_KEY:
-        raise HTTPException(status_code=500, detail="No se configuró GOOGLE_API_KEY")
+        # Corrección del mensaje para mantener consistencia
+        raise HTTPException(status_code=500, detail="No se configuró GOOGLE_MAPS_API_KEY")
 
     params = {
         "origins": f"{o_lat},{o_lng}",
@@ -983,9 +986,15 @@ async def coverage_details(
             pickup_time_iso = sd.pickup_time_iso
             delivery_time_iso_out = sd.delivery_time_iso
         else:
-            # Fallback: USD 2 por milla conducida (según tu requerimiento)
+            # Fallback: USD 2 por milla conducida, con mínimo de USD 6 si NO hay cobertura
             miles_for_cost = float(near.driving_distance_miles or d_miles or 0.0)
-            cost_int = int(math.ceil(miles_for_cost * DELIVERY_RATE_USD_PER_MILE))
+            base_cost = miles_for_cost * DELIVERY_RATE_USD_PER_MILE
+
+            # >>> REGLA NUEVA: mínimo en no-cobertura
+            if not near.in_coverage:
+                base_cost = max(base_cost, DELIVERY_MIN_USD_OUT_OF_COVERAGE)
+
+            cost_int = int(math.ceil(base_cost))
 
     return CoverageDetailsResponse(
         place_id=place_id,
