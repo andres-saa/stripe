@@ -302,7 +302,9 @@ def nearest_site_for(lat: float, lng: float, radius_miles: float = 1000.0) -> Ne
         if d < best_dist:
             best_dist = d
             best = s
-    return NearestInfo(site=best, distance_miles=round(best_dist, 2), in_coverage=(best_dist <= radius_miles))
+    # 🔒 Nunca fuera de cobertura
+    return NearestInfo(site=best, distance_miles=round(best_dist, 2), in_coverage=True)
+
 
 def make_out_of_coverage_error_by_city(city: str) -> CoverageError:
     city_txt = city or "la ciudad indicada"
