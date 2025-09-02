@@ -7,6 +7,8 @@ import os, math, asyncio, uuid
 import httpx
 from dotenv import load_dotenv
 import re
+from datetime import datetime, timezone
+
 
 load_dotenv()
 
@@ -154,10 +156,14 @@ class CoverageDetailsResponse(BaseModel):
     delivery_cost_cop: Optional[int] = None   # (en USD si viene de Shipday; nombre por compat)
     distance_miles: Optional[float] = None
     dropoff: Optional[Dropoff] = None
-    pickup_duration_minutes: Optional[int] = None     # ← pickupDuration
-    delivery_duration_minutes: Optional[int] = None   # ← deliveryDuration
-    pickup_time_iso: Optional[str] = None             # ← pickupTime
-    delivery_time_iso: Optional[str] = None           # ← deliveryTime
+    pickup_duration_minutes: Optional[int] = None
+    delivery_duration_minutes: Optional[int] = None
+    pickup_time_iso: Optional[str] = None
+    delivery_time_iso: Optional[str] = None
+    # 👇 NUEVOS CAMPOS DE AUDITORÍA SHIPDAY
+    shipday_payload: Optional[Dict[str, Any]] = None
+    shipday_response: Optional[Any] = None
+    shipday_requested_at_iso: Optional[str] = None
     error: Optional[CoverageError] = None
 
 class ShipdayAvailability(BaseModel):
@@ -492,9 +498,13 @@ async def shipday_quote_fee_by_address(
     pickup_address: str,
     delivery_address: str,
     delivery_time_iso: Optional[str] = None
-) -> Optional[ShipdayAvailability]:
+) -> Tuple[Optional[ShipdayAvailability], Optional[Dict[str, Any]], Optional[Any], str]:
+    """
+    Devuelve (best_availability, payload_enviado, respuesta_cruda, timestamp_iso_utc)
+    """
+    ts_iso = datetime.now(timezone.utc).isoformat()
     if not SHIPDAY_API_KEY:
-        return None
+        return None, None, None, ts_iso
 
     headers = {
         "Authorization": _shipday_auth_value(),
@@ -511,18 +521,24 @@ async def shipday_quote_fee_by_address(
     try:
         resp = await client.post(SHIPDAY_AVAILABILITY_URL, headers=headers, json=payload, timeout=1000.0)
     except Exception:
-        return None
+        return None, payload, None, ts_iso
 
     if resp.status_code != 200:
-        return None
+        # devolvemos el cuerpo por si Shipday trae error útil
+        raw = None
+        try:
+            raw = resp.json()
+        except Exception:
+            raw = {"_non_json_body": resp.text}
+        return None, payload, raw, ts_iso
 
     try:
         data = resp.json()
     except Exception:
-        return None
+        return None, payload, {"_non_json_body": resp.text}, ts_iso
 
     if not isinstance(data, list):
-        return None
+        return None, payload, data, ts_iso
 
     preferred = SHIPDAY_PREFERRED_PROVIDER
 
@@ -566,7 +582,7 @@ async def shipday_quote_fee_by_address(
             if best is None or current.fee < best.fee:
                 best = current
 
-    return best
+    return best, payload, data, ts_iso
 
 # Versión por coordenadas (compat)
 async def shipday_quote_fee(
@@ -893,6 +909,7 @@ async def places_details_endpoint(
         lat, lng, formatted = await places_details(client, place_id, session_token)
     return GeocodedPoint(query=place_id, formatted_address=formatted, lat=lat, lng=lng)
 
+
 @router.get("/places/coverage-details", response_model=CoverageDetailsResponse)
 async def coverage_details(
     place_id: str = Query(..., description="Place ID seleccionado por el usuario"),
@@ -909,7 +926,7 @@ async def coverage_details(
         if drop_errs:
             return CoverageDetailsResponse(
                 place_id=place_id,
-                formatted_address=formatted,  # puede ser el formatted de Google si falló la estricta
+                formatted_address=formatted,
                 lat=dlat,
                 lng=dlng,
                 nearest=None,
@@ -920,6 +937,9 @@ async def coverage_details(
                 delivery_duration_minutes=None,
                 pickup_time_iso=None,
                 delivery_time_iso=None,
+                shipday_payload=None,
+                shipday_response=None,
+                shipday_requested_at_iso=None,
                 error=CoverageError(
                     code="MALFORMED_ADDRESS",
                     message_es="Por favor selecciona una dirección exacta con número y código postal. "
@@ -931,7 +951,6 @@ async def coverage_details(
                 ),
             )
 
-        # Etiqueta estricta garantizada aquí
         strict_label = _address_to_str(address)
         dropoff = Dropoff(address=address)
 
@@ -950,10 +969,12 @@ async def coverage_details(
                 delivery_duration_minutes=None,
                 pickup_time_iso=None,
                 delivery_time_iso=None,
+                shipday_payload=None,
+                shipday_response=None,
+                shipday_requested_at_iso=None,
                 error=make_out_of_coverage_error_by_city(address.city),
             )
 
-        # Distancia por conducción
         s = near.site["location"]
         try:
             driving_miles, _ = await driving_distance_miles(
@@ -962,11 +983,9 @@ async def coverage_details(
             near.driving_distance_miles = round(driving_miles, 2)
             d_miles = driving_miles
         except Exception:
-            # fallback si falla Distance Matrix: usar haversine
             d_miles = near.distance_miles
             near.driving_distance_miles = None
 
-        # ── Regla de cobertura por distancia CONDUCIDA ──
         if d_miles is not None and float(d_miles) > MAX_DRIVING_DISTANCE_MILES:
             return CoverageDetailsResponse(
                 place_id=place_id,
@@ -975,12 +994,15 @@ async def coverage_details(
                 lng=dlng,
                 nearest=near,
                 delivery_cost_cop=None,
-                distance_miles=None,  # mantenemos None en error para no romper front
+                distance_miles=None,
                 dropoff=dropoff,
                 pickup_duration_minutes=None,
                 delivery_duration_minutes=None,
                 pickup_time_iso=None,
                 delivery_time_iso=None,
+                shipday_payload=None,
+                shipday_response=None,
+                shipday_requested_at_iso=None,
                 error=CoverageError(
                     code="OUT_OF_COVERAGE",
                     message_es=(
@@ -997,10 +1019,10 @@ async def coverage_details(
         distance_miles_report = round(float(d_miles), DISTANCE_REPORT_DECIMALS)
 
         pickup_addr_str   = _site_pickup_address_str(near.site)
-        delivery_addr_str = strict_label  # ya en formato estricto
+        delivery_addr_str = strict_label
 
-        # Intentar cotizar con Shipday (solo si está dentro de cobertura por distancia)
-        sd = await shipday_quote_fee_by_address(
+        # 👇 ahora obtenemos disponibilidad + payload + respuesta + timestamp
+        sd, sd_payload, sd_raw, sd_ts = await shipday_quote_fee_by_address(
             client,
             pickup_address=pickup_addr_str,
             delivery_address=delivery_addr_str,
@@ -1035,6 +1057,9 @@ async def coverage_details(
         delivery_duration_minutes=delivery_duration_minutes,
         pickup_time_iso=pickup_time_iso,
         delivery_time_iso=delivery_time_iso_out,
+        shipday_payload=sd_payload,
+        shipday_response=sd_raw,
+        shipday_requested_at_iso=sd_ts,
         error=None
     )
 
