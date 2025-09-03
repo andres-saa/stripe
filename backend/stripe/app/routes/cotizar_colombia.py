@@ -6,6 +6,7 @@ import httpx
 from dotenv import load_dotenv
 import re
 import unicodedata
+from datetime import datetime, timezone  # ← para timestamps de auditoría Shipday
 
 load_dotenv()
 
@@ -65,10 +66,43 @@ def _to_km_from_shipday(v: float) -> float:
     # asume millas -> km
     return float(v) * 1.609344
 
+# ======= NUEVO: disponibilidad Shipday (metadatos) =======
+SHIPDAY_AVAILABILITY_URL = "https://api.shipday.com/on-demand/availability"
+SHIPDAY_PREFERRED_PROVIDER = (os.getenv("SHIPDAY_PREFERRED_PROVIDER", "uber") or "uber").strip().lower()
+
+def _as_int(val: Any) -> Optional[int]:
+    if val is None or isinstance(val, bool):
+        return None
+    if isinstance(val, (int, float)):
+        return int(val)
+    if isinstance(val, str):
+        m = re.search(r"\d+", val)
+        return int(m.group(0)) if m else None
+    return None
+
+def _provider_name(item: Dict[str, Any]) -> str:
+    def _norm(s: Optional[str]) -> str:
+        return (s or "").strip().lower()
+
+    candidates: List[str] = []
+    keys = (
+        "provider", "providerName", "name", "service", "serviceName",
+        "deliveryPartner", "serviceProviderName", "channel", "source",
+        "thirdPartyDeliveryService", "deliveryServiceName"
+    )
+    for k in keys:
+        v = item.get(k)
+        if isinstance(v, dict):
+            for kk in ("name", "provider", "displayName", "title"):
+                vv = v.get(kk)
+                if isinstance(vv, str):
+                    candidates.append(vv)
+        elif isinstance(v, str):
+            candidates.append(v)
+    return " ".join(sorted({_norm(x) for x in candidates if x}))
 
 # Router con prefijo para Colombia
 router = APIRouter(prefix="/co")
-
 
 SEDES: List[Dict[str, Any]] = [
     {
@@ -301,7 +335,6 @@ SEDES: List[Dict[str, Any]] = [
     },
 ]
 
-
 # ─────────── Helpers de texto ───────────
 
 def _strip_accents(s: str) -> str:
@@ -444,9 +477,19 @@ class Address(BaseModel):
     zip: str
     country: str
 
+# ======= NUEVO: metadatos de disponibilidad Shipday =======
+class ShipdayAvailability(BaseModel):
+    provider: str
+    fee: float
+    pickup_duration_minutes: Optional[int] = None
+    delivery_duration_minutes: Optional[int] = None
+    pickup_time_iso: Optional[str] = None
+    delivery_time_iso: Optional[str] = None
+
+# ⬇️ Dropoff ahora incluye raw_address para auditoría
 class Dropoff(BaseModel):
     address: Address
-
+    raw_address: Optional[str] = None
 
 class CoverageDetailsResponse(BaseModel):
     place_id: str
@@ -457,6 +500,16 @@ class CoverageDetailsResponse(BaseModel):
     delivery_cost_cop: Optional[int] = None
     distance_km: Optional[float] = None
     dropoff: Optional[Dropoff] = None
+
+    # ===== NUEVO: metadatos/auditoría Shipday (no afectan el precio) =====
+    pickup_duration_minutes: Optional[int] = None
+    delivery_duration_minutes: Optional[int] = None
+    pickup_time_iso: Optional[str] = None
+    delivery_time_iso: Optional[str] = None
+    shipday_payload: Optional[Dict[str, Any]] = None
+    shipday_response: Optional[Any] = None
+    shipday_requested_at_iso: Optional[str] = None
+
     error: Optional[CoverageError] = None
 
 class ShipdayDistanceResponse(BaseModel):
@@ -478,7 +531,7 @@ def haversine_miles(lat1: float, lon1: float, lat2: float, lon2: float) -> float
     phi2 = math.radians(lat2)
     dphi = math.radians(lat2 - lat1)
     dlambda = math.radians(lon2 - lon1)
-    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
+    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) ** 2 * math.sin(dlambda / 2) ** 2
     c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
     return R_miles * c
 
@@ -704,7 +757,7 @@ def make_out_of_coverage_error_by_city(city: str) -> CoverageError:
         message_en=f"No coverage in {city_txt}. We don't have locations in that city yet.",
     )
 
-# ─────────── HELPERS SHIPDAY ───────────
+# ─────────── HELPERS SHIPDAY: pedido efímero para distancia ───────────
 
 async def _shipday_insert_order_for_distance(
     client: httpx.AsyncClient,
@@ -812,6 +865,73 @@ async def _shipday_probe_distance(
         await _shipday_delete_order(client, order_id)
     return float(distance_raw), _to_km_from_shipday(distance_raw)
 
+# ======= NUEVO: helper para metadatos de disponibilidad Shipday por direcciones =======
+async def shipday_quote_meta_by_address(
+    client: httpx.AsyncClient,
+    pickup_address: str,
+    delivery_address: str,
+    delivery_time_iso: Optional[str] = None,
+) -> Tuple[Optional[ShipdayAvailability], Optional[Dict[str, Any]], Optional[Any], str]:
+    """
+    Devuelve (best_availability, payload_enviado, respuesta_cruda, timestamp_iso_utc).
+    No se usa 'fee' para precio (el cálculo sigue con compute_delivery_cost_cop).
+    """
+    ts_iso = datetime.now(timezone.utc).isoformat()
+    if not SHIPDAY_API_KEY:
+        return None, None, None, ts_iso
+
+    headers = _shipday_headers()
+    payload: Dict[str, Any] = {
+        "pickupAddress": pickup_address,
+        "deliveryAddress": delivery_address,
+    }
+    if delivery_time_iso:
+        payload["deliveryTime"] = delivery_time_iso
+
+    try:
+        resp = await client.post(SHIPDAY_AVAILABILITY_URL, headers=headers, json=payload, timeout=1000.0)
+    except Exception:
+        return None, payload, None, ts_iso
+
+    if resp.status_code != 200:
+        raw = None
+        try:
+            raw = resp.json()
+        except Exception:
+            raw = {"_non_json_body": resp.text}
+        return None, payload, raw, ts_iso
+
+    try:
+        data = resp.json()
+    except Exception:
+        return None, payload, {"_non_json_body": resp.text}, ts_iso
+
+    if not isinstance(data, list):
+        return None, payload, data, ts_iso
+
+    preferred = SHIPDAY_PREFERRED_PROVIDER or "uber"
+    best: Optional[ShipdayAvailability] = None
+    for item in data:
+        if not item or item.get("error") is True:
+            continue
+        fee = item.get("fee")
+        if not isinstance(fee, (int, float)):
+            continue
+        name = _provider_name(item)
+        if preferred in name:
+            current = ShipdayAvailability(
+                provider=preferred,
+                fee=float(fee),
+                pickup_duration_minutes=_as_int(item.get("pickupDuration")),
+                delivery_duration_minutes=_as_int(item.get("deliveryDuration")),
+                pickup_time_iso=item.get("pickupTime"),
+                delivery_time_iso=item.get("deliveryTime"),
+            )
+            if best is None or current.fee < best.fee:
+                best = current
+
+    return best, payload, data, ts_iso
+
 # ─────────── Endpoints ───────────
 
 @router.get("/places/autocomplete", response_model=AutocompleteLiteResponse)
@@ -855,16 +975,12 @@ async def coverage_details(
     place_id: str = Query(..., description="Place ID seleccionado por el usuario"),
     session_token: Optional[str] = Query(None, description="Token de sesión usado en Autocomplete"),
     language: str = Query("es", description="Idioma para Distance Matrix"),
+    delivery_time_iso: Optional[str] = Query(None, description="Hora de entrega ISO-8601 (UTC), opcional para Shipday")  # NUEVO
 ):
     """
-    Cobertura por CIUDAD:
-    - Se resuelve el place_id → (lat,lng,components)
-    - Se extrae la ciudad del dropoff (normalizada)
-    - Si coincide con la ciudad de alguna sede → hay cobertura
-      * Elegimos la sede más cercana (Haversine) dentro de la misma ciudad
-      * Calculamos distancia por carretera (Distance Matrix) y si falla, Haversine
-      * Calculamos el costo según los tramos configurados
-    - Si no coincide con ninguna sede → OUT_OF_COVERAGE
+    Cobertura por CIUDAD (precio por tramos en COP) + metadatos Shipday (opcional).
+    - Precio se calcula SIEMPRE con compute_delivery_cost_cop(distance_km).
+    - Shipday solo aporta tiempos/fechas y auditoría; su 'fee' NO se usa para cobrar.
     """
     async with httpx.AsyncClient() as client:
         # 0) Asegurar datos de sedes (coords + city_norm)
@@ -882,16 +998,23 @@ async def coverage_details(
         near = nearest_among_same_city(dlat, dlng, drop_city_norm)
 
         if not near.in_coverage or not near.site:
-            # fuera de cobertura por ciudad
             return CoverageDetailsResponse(
                 place_id=place_id,
                 formatted_address=formatted,
                 lat=dlat,
                 lng=dlng,
                 nearest=None,
-                delivery_cost_cop=None, 
+                delivery_cost_cop=None,
                 distance_km=None,
                 dropoff=dropoff,
+                # metadatos Shipday nulos
+                pickup_duration_minutes=None,
+                delivery_duration_minutes=None,
+                pickup_time_iso=None,
+                delivery_time_iso=None,
+                shipday_payload=None,
+                shipday_response=None,
+                shipday_requested_at_iso=None,
                 error=make_out_of_coverage_error_by_city(address.city),
             )
 
@@ -908,18 +1031,55 @@ async def coverage_details(
         # Redondeo de reporte (solo visual)
         distance_km_report = round(distance_km, DISTANCE_REPORT_DECIMALS)
 
-        # 5) Calcular costo por tramos
+        # 5) Calcular costo por tramos (SE MANTIENE TAL CUAL)
         delivery_cost = compute_delivery_cost_cop(distance_km)
+
+        # 6) (Opcional) Consultar metadatos de disponibilidad en Shipday — NO afecta el precio
+        sd = None
+        sd_payload = None
+        sd_raw = None
+        sd_ts = None
+        pickup_duration_minutes = None
+        delivery_duration_minutes = None
+        pickup_time_iso = None
+        delivery_time_iso_out = None
+
+        try:
+            if SHIPDAY_API_KEY:
+                pickup_addr_str = near.site["site_address"]                    # tal como está registrada
+                delivery_addr_str = raw_address or formatted                   # limpio y estable
+                sd, sd_payload, sd_raw, sd_ts = await shipday_quote_meta_by_address(
+                    client=client,
+                    pickup_address=pickup_addr_str,
+                    delivery_address=delivery_addr_str,
+                    delivery_time_iso=delivery_time_iso,
+                )
+                if isinstance(sd, ShipdayAvailability):
+                    pickup_duration_minutes = sd.pickup_duration_minutes
+                    delivery_duration_minutes = sd.delivery_duration_minutes
+                    pickup_time_iso = sd.pickup_time_iso
+                    delivery_time_iso_out = sd.delivery_time_iso
+        except Exception:
+            # No bloquear si Shipday falla; devolvemos igual la cobertura y el precio
+            pass
 
     return CoverageDetailsResponse(
         place_id=place_id,
         formatted_address=formatted,
         lat=dlat,
         lng=dlng,
-        nearest=near,                     # sede asignada más cercana en la ciudad
-        delivery_cost_cop=delivery_cost,  # costo por tramos
-        distance_km=distance_km_report,   # distancia (km) reportada
+        nearest=near,                          # sede asignada más cercana en la ciudad
+        delivery_cost_cop=delivery_cost,       # costo por tramos (SE MANTIENE)
+        distance_km=distance_km_report,        # distancia (km) reportada
         dropoff=dropoff,
+        # ===== Metadatos/auditoría Shipday (opcionales) =====
+        pickup_duration_minutes=pickup_duration_minutes,
+        delivery_duration_minutes=delivery_duration_minutes,
+        pickup_time_iso=pickup_time_iso,
+        delivery_time_iso=delivery_time_iso_out,
+        shipday_payload=sd_payload,
+        shipday_response=sd_raw,
+        shipday_requested_at_iso=sd_ts,
         error=None
     )
 
@@ -1015,8 +1175,7 @@ async def shipday_distance_from_nearest_site(
             )
 
         pickup_addr_str = near.site["site_address"]  # dirección tal cual la tienes registrada en Shipday
-        # mejor enviar el dropoff “limpio”:
-        dropoff_addr_str = raw_address or formatted
+        dropoff_addr_str = raw_address or formatted  # mejor enviar el dropoff “limpio”
 
         # Probar distancia en Shipday (pedido efímero)
         try:
