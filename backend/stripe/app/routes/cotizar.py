@@ -8,6 +8,7 @@ import httpx
 from dotenv import load_dotenv
 import re
 from datetime import datetime, timezone
+import requests
 
 load_dotenv()
 
@@ -22,13 +23,24 @@ GEOCODE_URL             = "https://maps.googleapis.com/maps/api/geocode/json"
 DISTANCE_MATRIX_URL     = "https://maps.googleapis.com/maps/api/distancematrix/json"
 
 # Shipday
-SHIPDAY_API_KEY = os.getenv("SHIPDAY_API_KEY")
-if not SHIPDAY_API_KEY:
-    print("⚠️  Falta SHIPDAY_API_KEY en el entorno (.env)")
+# Mantén variables separadas para US y Colombia
+SHIPDAY_API_KEY_US = (
+    os.getenv("SHIPDAY_API_KEY")
+    or os.getenv("SHIPDAY_APIKEY")
+)
+SHIPDAY_API_KEY_COLOMBIA = (
+    os.getenv("SHIPDAY_API_KEY_COLOMBIA")
+    or os.getenv("SHIPDAY_APIKEY_COLOMBIA")
+)
+
+if not SHIPDAY_API_KEY_US:
+    print("⚠️  Falta SHIPDAY_API_KEY (USA) en el entorno (.env)")
+if not SHIPDAY_API_KEY_COLOMBIA:
+    print("ℹ️  No se encontró SHIPDAY_API_KEY_COLOMBIA (solo informativo si no operas en CO)")
+
 SHIPDAY_AVAILABILITY_URL = "https://api.shipday.com/on-demand/availability"
 
 # Fallback si Shipday no devuelve tarifa (USD por milla)
-# ⇨ Por tu pedido, dejamos 2.0 USD/milla como predeterminado.
 DELIVERY_RATE_USD_PER_MILE = float(os.getenv("DELIVERY_RATE_USD_PER_MILE", "2.0"))
 # Mínimo cuando NO hay cobertura (aplica sólo en fallback)
 DELIVERY_MIN_USD_OUT_OF_COVERAGE = float(os.getenv("DELIVERY_MIN_USD_OUT_OF_COVERAGE", "6.0"))
@@ -302,9 +314,8 @@ def nearest_site_for(lat: float, lng: float, radius_miles: float = 1000.0) -> Ne
         if d < best_dist:
             best_dist = d
             best = s
-    # 🔒 Nunca fuera de cobertura
+    # 🔒 Nunca fuera de cobertura (por ahora)
     return NearestInfo(site=best, distance_miles=round(best_dist, 2), in_coverage=True)
-
 
 def make_out_of_coverage_error_by_city(city: str) -> CoverageError:
     city_txt = city or "la ciudad indicada"
@@ -469,10 +480,14 @@ async def driving_distance_miles(
 
 # ─────────── Shipday helpers ───────────
 
-SHIPDAY_PREFERRED_PROVIDER = os.getenv("SHIPDAY_PREFERRED_PROVIDER", "uber").strip().lower()
+SHIPDAY_PREFERRED_PROVIDER = (os.getenv("SHIPDAY_PREFERRED_PROVIDER", "uber")).strip().lower()
 
-def _shipday_auth_value() -> str:
-    key = (SHIPDAY_API_KEY or "").strip()
+def _shipday_auth_value(api_key_override: Optional[str] = None) -> str:
+    """
+    Devuelve el valor de Authorization para Shipday.
+    Si api_key_override viene, se usa esa; de lo contrario se usa la de US por defecto.
+    """
+    key = (api_key_override or SHIPDAY_API_KEY_US or "").strip()
     if not key:
         return ""
     return key if key.lower().startswith("basic ") else f"Basic {key}"
@@ -487,21 +502,45 @@ def _as_int(val: Any) -> Optional[int]:
         return int(m.group(0)) if m else None
     return None
 
+def _provider_name(item: Dict[str, Any]) -> str:
+    def _norm(s: Optional[str]) -> str:
+        return (s or "").strip().lower()
+
+    candidates: List[str] = []
+    keys = (
+        "provider", "providerName", "name", "service", "serviceName",
+        "deliveryPartner", "serviceProviderName", "channel", "source",
+        "thirdPartyDeliveryService", "deliveryServiceName"
+    )
+    for k in keys:
+        v = item.get(k)
+        if isinstance(v, dict):
+            for kk in ("name", "provider", "displayName", "title"):
+                vv = v.get(kk)
+                if isinstance(vv, str):
+                    candidates.append(vv)
+        elif isinstance(v, str):
+            candidates.append(v)
+    return " ".join(sorted({_norm(x) for x in candidates if x}))
+
 async def shipday_quote_fee_by_address(
     client: httpx.AsyncClient,
     pickup_address: str,
     delivery_address: str,
-    delivery_time_iso: Optional[str] = None
+    delivery_time_iso: Optional[str] = None,
+    preferred_provider: Optional[str] = None,
+    api_key: Optional[str] = None,  # 👈 ahora se puede inyectar la key a usar
 ) -> Tuple[Optional[ShipdayAvailability], Optional[Dict[str, Any]], Optional[Any], str]:
     """
     Devuelve (best_availability, payload_enviado, respuesta_cruda, timestamp_iso_utc)
     """
     ts_iso = datetime.now(timezone.utc).isoformat()
-    if not SHIPDAY_API_KEY:
+    if not (api_key or SHIPDAY_API_KEY_US):
+        # Sin ninguna API key utilizable
         return None, None, None, ts_iso
 
     headers = {
-        "Authorization": _shipday_auth_value(),
+        "Authorization": _shipday_auth_value(api_key),
         "Content-Type": "application/json",
         "Accept": "application/json",
     }
@@ -533,28 +572,7 @@ async def shipday_quote_fee_by_address(
     if not isinstance(data, list):
         return None, payload, data, ts_iso
 
-    preferred = SHIPDAY_PREFERRED_PROVIDER
-
-    def _norm(s: Optional[str]) -> str:
-        return (s or "").strip().lower()
-
-    def _provider_name(item: Dict[str, Any]) -> str:
-        candidates: List[str] = []
-        keys = (
-            "provider", "providerName", "name", "service", "serviceName",
-            "deliveryPartner", "serviceProviderName", "channel", "source",
-            "thirdPartyDeliveryService", "deliveryServiceName"
-        )
-        for k in keys:
-            v = item.get(k)
-            if isinstance(v, dict):
-                for kk in ("name", "provider", "displayName", "title"):
-                    vv = v.get(kk)
-                    if isinstance(vv, str):
-                        candidates.append(vv)
-            elif isinstance(v, str):
-                candidates.append(v)
-        return " ".join(sorted({_norm(x) for x in candidates if x}))
+    preferred = (preferred_provider or SHIPDAY_PREFERRED_PROVIDER or "uber").strip().lower()
 
     best: Optional[ShipdayAvailability] = None
     for item in data:
@@ -577,14 +595,114 @@ async def shipday_quote_fee_by_address(
 
     return best, payload, data, ts_iso
 
+
+class ShipdayAvailabilityRequest(BaseModel):
+    pickup_address: str
+    delivery_address: str
+    delivery_time_iso: Optional[str] = None  # opcional, ISO-8601 en UTC
+
+class ShipdayAvailabilityResponse(BaseModel):
+    available: bool
+    availability: Optional[ShipdayAvailability] = None  # cuando hay Uber
+    shipday_payload: Optional[Dict[str, Any]] = None    # auditoría
+    shipday_response: Optional[Any] = None              # respuesta cruda de Shipday
+    shipday_requested_at_iso: str
+    error: Optional[CoverageError] = None
+
+# ─────────── Selección de API key por site ───────────
+
+US_SITE_IDS = {33, 35, 36, 37}  # amplía aquí si agregas más sedes US
+
+def select_shipday_api_key_for_site(site_id: Optional[int]) -> Optional[str]:
+    """
+    Devuelve la API key según el site_id.
+    """
+    if site_id in US_SITE_IDS:
+        return SHIPDAY_API_KEY_US
+    # Para cualquier otro site, usa CO si está disponible
+    return SHIPDAY_API_KEY_COLOMBIA or SHIPDAY_API_KEY_US
+
+# ─────────── Endpoints ───────────
+
+@router.post("/shipday/availability/{order_id}")
+async def shipday_availability(order_id: str):
+    """
+    Consulta disponibilidad EXCLUSIVA de Uber en Shipday entre dos direcciones (pickup y delivery).
+    ⚠️ Por requerimiento: usar SIEMPRE la API key de USA en la consulta.
+    """
+    # Si no hay API key US, devolvemos error controlado
+    if not SHIPDAY_API_KEY_US:
+        ts_iso = datetime.now(timezone.utc).isoformat()
+        return ShipdayAvailabilityResponse(
+            available=False,
+            availability=None,
+            shipday_payload=None,
+            shipday_response=None,
+            shipday_requested_at_iso=ts_iso,
+            error=CoverageError(
+                code="SHIPDAY_DISABLED",
+                message_es="Shipday (USA) no está configurado (falta SHIPDAY_API_KEY).",
+                message_en="Shipday (USA) is not configured (missing SHIPDAY_API_KEY).",
+            ),
+        )
+
+    # Obtener orden desde tu backend
+    body = None
+    try:
+        resp = requests.get(f"https://backend.salchimonster.com/order/{order_id}", timeout=15)
+        body = resp.json()
+    except Exception:
+        body = {"raw": getattr(resp, "text", None)}
+
+    # Aunque identifiquemos el site, forzaremos la key de USA para esta operación
+    site_id = (body or {}).get("site_id")
+    _ = select_shipday_api_key_for_site(site_id)  # disponible si en el futuro quieres usarlo
+
+    pickup_address = body["address_details"]["shipday_payload"]["pickupAddress"]
+    delivery_address = body["address_details"]["shipday_payload"]["deliveryAddress"]
+
+    async with httpx.AsyncClient() as client:
+        best, payload, raw, ts = await shipday_quote_fee_by_address(
+            client=client,
+            pickup_address=pickup_address,
+            delivery_address=delivery_address,
+            preferred_provider="uber",      # 👈 fuerza Uber SIEMPRE
+            api_key=SHIPDAY_API_KEY_US,     # 👈 fuerza SIEMPRE API key USA
+        )
+
+    if isinstance(best, ShipdayAvailability):
+        return ShipdayAvailabilityResponse(
+            available=True,
+            availability=best,
+            shipday_payload=payload,
+            shipday_response=raw,
+            shipday_requested_at_iso=ts,
+            error=None,
+        )
+
+    # Sin disponibilidad de Uber (o error)
+    return ShipdayAvailabilityResponse(
+        available=False,
+        availability=None,
+        shipday_payload=payload,
+        shipday_response=raw,
+        shipday_requested_at_iso=ts,
+        error=CoverageError(
+            code="NO_UBER_AVAILABLE",
+            message_es="No hay disponibilidad con Uber para estas direcciones.",
+            message_en="No Uber availability for these addresses.",
+        ),
+    )
+
 # Versión por coordenadas (compat)
 async def shipday_quote_fee(
     client: httpx.AsyncClient,
     pickup_lat: float, pickup_lng: float,
-    drop_lat: float, drop_lng: float
+    drop_lat: float, drop_lng: float,
+    api_key: Optional[str] = None,  # 👈 ahora se puede inyectar la key
 ) -> Optional[float]:
     headers = {
-        "Authorization": _shipday_auth_value(),
+        "Authorization": _shipday_auth_value(api_key),
         "Content-Type": "application/json",
         "Accept": "application/json",
     }
@@ -612,27 +730,6 @@ async def shipday_quote_fee(
         return None
 
     preferred = SHIPDAY_PREFERRED_PROVIDER
-
-    def _norm(s: Optional[str]) -> str:
-        return (s or "").strip().lower()
-
-    def _provider_name(item: Dict[str, Any]) -> str:
-        candidates: List[str] = []
-        keys = (
-            "provider", "providerName", "name", "service", "serviceName",
-            "deliveryPartner", "serviceProviderName", "channel", "source",
-            "thirdPartyDeliveryService", "deliveryServiceName"
-        )
-        for k in keys:
-            v = item.get(k)
-            if isinstance(v, dict):
-                for kk in ("name", "provider", "displayName", "title"):
-                    vv = v.get(kk)
-                    if isinstance(vv, str):
-                        candidates.append(vv)
-            elif isinstance(v, str):
-                candidates.append(v)
-        return " ".join(sorted({_norm(x) for x in candidates if x}))
 
     uber_fees: List[float] = []
     for item in data:
@@ -800,8 +897,6 @@ async def _fallback_address_suggestions(
                         break
     return results
 
-# ─────────── Endpoints ───────────
-
 @router.get("/places/autocomplete", response_model=AutocompleteLiteResponse)
 async def places_autocomplete(
     input: str = Query(..., min_length=1, description="Texto parcial de dirección"),
@@ -902,7 +997,6 @@ async def places_details_endpoint(
         lat, lng, formatted = await places_details(client, place_id, session_token)
     return GeocodedPoint(query=place_id, formatted_address=formatted, lat=lat, lng=lng)
 
-
 @router.get("/places/coverage-details", response_model=CoverageDetailsResponse)
 async def coverage_details(
     place_id: str = Query(..., description="Place ID seleccionado por el usuario"),
@@ -967,12 +1061,13 @@ async def coverage_details(
         pickup_addr_str   = _site_pickup_address_str(near.site)
         delivery_addr_str = strict_label
 
-        # 👇 obtenemos disponibilidad + payload + respuesta + timestamp
+        # 👇 obtenemos disponibilidad + payload + respuesta + timestamp (forzando API key USA)
         sd, sd_payload, sd_raw, sd_ts = await shipday_quote_fee_by_address(
             client,
             pickup_address=pickup_addr_str,
             delivery_address=delivery_addr_str,
-            delivery_time_iso=delivery_time_iso
+            delivery_time_iso=delivery_time_iso,
+            api_key=SHIPDAY_API_KEY_US,  # 👈 fuerza SIEMPRE API key USA como pediste
         )
 
         pickup_duration_minutes: Optional[int] = None
@@ -991,11 +1086,8 @@ async def coverage_details(
             # Fallback: USD 2 por milla conducida, con mínimo de USD 6 si NO hay cobertura
             miles_for_cost = float(near.driving_distance_miles or d_miles or 0.0)
             base_cost = miles_for_cost * DELIVERY_RATE_USD_PER_MILE
-
-            # >>> REGLA NUEVA: mínimo en no-cobertura
             if not near.in_coverage:
                 base_cost = max(base_cost, DELIVERY_MIN_USD_OUT_OF_COVERAGE)
-
             cost_int = int(math.ceil(base_cost))
 
     return CoverageDetailsResponse(
