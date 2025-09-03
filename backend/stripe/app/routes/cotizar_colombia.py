@@ -44,14 +44,14 @@ DISTANCE_BILLING_MODE       = os.getenv("DISTANCE_BILLING_MODE", "ceil")  # 'cei
 DISTANCE_REPORT_DECIMALS    = int(os.getenv("DISTANCE_REPORT_DECIMALS", "2"))
 
 # ======= CONFIG SHIPDAY =======
-SHIPDAY_API_KEY = os.getenv("SHIPDAY_API_KEY", "").strip()
+SHIPDAY_API_KEY_COLOMBIA = os.getenv("SHIPDAY_API_KEY_COLOMBIA", "").strip()
 SHIPDAY_DISTANCE_UNITS = (os.getenv("SHIPDAY_DISTANCE_UNITS", "km") or "km").strip().lower()  # 'km' o 'mi'
 
 def _shipday_headers() -> Dict[str, str]:
-    if not SHIPDAY_API_KEY:
-        raise HTTPException(status_code=500, detail="No se configuró SHIPDAY_API_KEY")
+    if not SHIPDAY_API_KEY_COLOMBIA:
+        raise HTTPException(status_code=500, detail="No se configuró SHIPDAY_API_KEY_COLOMBIA")
     return {
-        "Authorization": f"Basic {SHIPDAY_API_KEY}",
+        "Authorization": f"Basic {SHIPDAY_API_KEY_COLOMBIA}",
         "Content-Type": "application/json",
         "Accept": "application/json",
     }
@@ -877,7 +877,7 @@ async def shipday_quote_meta_by_address(
     No se usa 'fee' para precio (el cálculo sigue con compute_delivery_cost_cop).
     """
     ts_iso = datetime.now(timezone.utc).isoformat()
-    if not SHIPDAY_API_KEY:
+    if not SHIPDAY_API_KEY_COLOMBIA:
         return None, None, None, ts_iso
 
     headers = _shipday_headers()
@@ -1045,7 +1045,7 @@ async def coverage_details(
         delivery_time_iso_out = None
 
         try:
-            if SHIPDAY_API_KEY:
+            if SHIPDAY_API_KEY_COLOMBIA:
                 pickup_addr_str = near.site["site_address"]                    # tal como está registrada
                 delivery_addr_str = raw_address or formatted                   # limpio y estable
                 sd, sd_payload, sd_raw, sd_ts = await shipday_quote_meta_by_address(
@@ -1150,8 +1150,8 @@ async def shipday_distance_from_nearest_site(
     Usa la sede más cercana dentro de la MISMA CIUDAD (como tu cobertura) y consulta a Shipday
     la distancia de conducción entre esa sede (pickup) y el destino (dropoff). NO calcula precio.
     """
-    if not SHIPDAY_API_KEY:
-        raise HTTPException(status_code=500, detail="No se configuró SHIPDAY_API_KEY")
+    if not SHIPDAY_API_KEY_COLOMBIA:
+        raise HTTPException(status_code=500, detail="No se configuró SHIPDAY_API_KEY_COLOMBIA")
 
     async with httpx.AsyncClient() as client:
         # Asegurar sedes con coords y city_norm
