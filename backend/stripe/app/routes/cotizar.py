@@ -34,9 +34,9 @@ SHIPDAY_API_KEY_COLOMBIA = (
 )
 
 if not SHIPDAY_API_KEY_US:
-    print("⚠️  Falta SHIPDAY_API_KEY (USA) en el entorno (.env)")
+    print("ℹ️  No se encontró SHIPDAY_API_KEY (USA). Solo informativo si no operas en USA.")
 if not SHIPDAY_API_KEY_COLOMBIA:
-    print("ℹ️  No se encontró SHIPDAY_API_KEY_COLOMBIA (solo informativo si no operas en CO)")
+    print("ℹ️  No se encontró SHIPDAY_API_KEY_COLOMBIA. Solo informativo si no operas en CO.")
 
 SHIPDAY_AVAILABILITY_URL = "https://api.shipday.com/on-demand/availability"
 
@@ -535,8 +535,8 @@ async def shipday_quote_fee_by_address(
     Devuelve (best_availability, payload_enviado, respuesta_cruda, timestamp_iso_utc)
     """
     ts_iso = datetime.now(timezone.utc).isoformat()
-    if not (api_key or SHIPDAY_API_KEY_US):
-        # Sin ninguna API key utilizable
+    if not api_key:
+        # Sin API key utilizable
         return None, None, None, ts_iso
 
     headers = {
@@ -615,23 +615,50 @@ US_SITE_IDS = {33, 35, 36, 37}  # amplía aquí si agregas más sedes US
 
 def select_shipday_api_key_for_site(site_id: Optional[int]) -> Optional[str]:
     """
-    Devuelve la API key según el site_id.
+    Devuelve la API key según el site_id (sin fallback entre regiones).
+    - Site en US_SITE_IDS  -> SHIPDAY_API_KEY_US
+    - Cualquier otro site  -> SHIPDAY_API_KEY_COLOMBIA
     """
     if site_id in US_SITE_IDS:
         return SHIPDAY_API_KEY_US
-    # Para cualquier otro site, usa CO si está disponible
-    return SHIPDAY_API_KEY_COLOMBIA or SHIPDAY_API_KEY_US
+    return SHIPDAY_API_KEY_COLOMBIA
 
 # ─────────── Endpoints ───────────
 
-@router.post("/shipday/availability/{order_id}")
+@router.post("/shipday/availability/{order_id}", response_model=ShipdayAvailabilityResponse)
 async def shipday_availability(order_id: str):
     """
-    Consulta disponibilidad EXCLUSIVA de Uber en Shipday entre dos direcciones (pickup y delivery).
-    ⚠️ Por requerimiento: usar SIEMPRE la API key de USA en la consulta.
+    Consulta disponibilidad (preferencia: Uber) en Shipday entre dos direcciones (pickup y delivery),
+    eligiendo AUTOMÁTICAMENTE la API key (USA o COLOMBIA) según el site de la orden (derivado del order_id).
     """
-    # Si no hay API key US, devolvemos error controlado
-    if not SHIPDAY_API_KEY_US:
+    # 1) Obtener orden desde tu backend
+    body = None
+    try:
+        resp = requests.get(f"https://backend.salchimonster.com/order/{order_id}", timeout=15)
+        if resp.status_code != 200:
+            raise RuntimeError(f"HTTP {resp.status_code}")
+        body = resp.json()
+    except Exception as e:
+        ts_iso = datetime.now(timezone.utc).isoformat()
+        return ShipdayAvailabilityResponse(
+            available=False,
+            availability=None,
+            shipday_payload=None,
+            shipday_response={"error": "ORDER_FETCH_FAILED", "detail": str(e)},
+            shipday_requested_at_iso=ts_iso,
+            error=CoverageError(
+                code="ORDER_FETCH_FAILED",
+                message_es="No fue posible obtener la orden desde el backend.",
+                message_en="Unable to fetch order from backend.",
+            ),
+        )
+
+    # 2) Determinar site y elegir la API key correcta (US o CO)
+    site_id = (body or {}).get("site_id")
+    api_key = select_shipday_api_key_for_site(site_id)
+
+    if (site_id in US_SITE_IDS and not SHIPDAY_API_KEY_US) or (site_id not in US_SITE_IDS and not SHIPDAY_API_KEY_COLOMBIA):
+        region = "USA" if site_id in US_SITE_IDS else "COLOMBIA"
         ts_iso = datetime.now(timezone.utc).isoformat()
         return ShipdayAvailabilityResponse(
             available=False,
@@ -640,34 +667,40 @@ async def shipday_availability(order_id: str):
             shipday_response=None,
             shipday_requested_at_iso=ts_iso,
             error=CoverageError(
-                code="SHIPDAY_DISABLED",
-                message_es="Shipday (USA) no está configurado (falta SHIPDAY_API_KEY).",
-                message_en="Shipday (USA) is not configured (missing SHIPDAY_API_KEY).",
+                code="SHIPDAY_DISABLED_REGION",
+                message_es=f"Shipday ({region}) no está configurado (falta API key).",
+                message_en=f"Shipday ({region}) is not configured (missing API key).",
             ),
         )
 
-    # Obtener orden desde tu backend
-    body = None
+    # 3) Extraer direcciones desde la orden
     try:
-        resp = requests.get(f"https://backend.salchimonster.com/order/{order_id}", timeout=15)
-        body = resp.json()
+        ad = (body.get("address_details") or {}).get("shipday_payload") or {}
+        pickup_address   = ad["pickupAddress"]
+        delivery_address = ad["deliveryAddress"]
     except Exception:
-        body = {"raw": getattr(resp, "text", None)}
+        ts_iso = datetime.now(timezone.utc).isoformat()
+        return ShipdayAvailabilityResponse(
+            available=False,
+            availability=None,
+            shipday_payload=None,
+            shipday_response={"order_body": body},
+            shipday_requested_at_iso=ts_iso,
+            error=CoverageError(
+                code="MISSING_ADDRESSES",
+                message_es="La orden no contiene pickupAddress/deliveryAddress en address_details.shipday_payload.",
+                message_en="Order does not contain pickupAddress/deliveryAddress in address_details.shipday_payload.",
+            ),
+        )
 
-    # Aunque identifiquemos el site, forzaremos la key de USA para esta operación
-    site_id = (body or {}).get("site_id")
-    _ = select_shipday_api_key_for_site(site_id)  # disponible si en el futuro quieres usarlo
-
-    pickup_address = body["address_details"]["shipday_payload"]["pickupAddress"]
-    delivery_address = body["address_details"]["shipday_payload"]["deliveryAddress"]
-
+    # 4) Consultar disponibilidad en Shipday con la API key elegida
     async with httpx.AsyncClient() as client:
         best, payload, raw, ts = await shipday_quote_fee_by_address(
             client=client,
             pickup_address=pickup_address,
             delivery_address=delivery_address,
-            preferred_provider="uber",      # 👈 fuerza Uber SIEMPRE
-            api_key=SHIPDAY_API_KEY_US,     # 👈 fuerza SIEMPRE API key USA
+            preferred_provider="uber",      # 👈 preferimos Uber (ajustable por env)
+            api_key=api_key,                # 👈 ahora usa automáticamente US o CO según site
         )
 
     if isinstance(best, ShipdayAvailability):
@@ -680,7 +713,7 @@ async def shipday_availability(order_id: str):
             error=None,
         )
 
-    # Sin disponibilidad de Uber (o error)
+    # Sin disponibilidad del proveedor preferido (o error)
     return ShipdayAvailabilityResponse(
         available=False,
         availability=None,
@@ -688,9 +721,9 @@ async def shipday_availability(order_id: str):
         shipday_response=raw,
         shipday_requested_at_iso=ts,
         error=CoverageError(
-            code="NO_UBER_AVAILABLE",
-            message_es="No hay disponibilidad con Uber para estas direcciones.",
-            message_en="No Uber availability for these addresses.",
+            code="NO_PREFERRED_PROVIDER_AVAILABLE",
+            message_es="No hay disponibilidad con el proveedor preferido para estas direcciones.",
+            message_en="No preferred provider availability for these addresses.",
         ),
     )
 
@@ -1061,13 +1094,13 @@ async def coverage_details(
         pickup_addr_str   = _site_pickup_address_str(near.site)
         delivery_addr_str = strict_label
 
-        # 👇 obtenemos disponibilidad + payload + respuesta + timestamp (forzando API key USA)
+        # 👇 obtenemos disponibilidad + payload + respuesta + timestamp
         sd, sd_payload, sd_raw, sd_ts = await shipday_quote_fee_by_address(
             client,
             pickup_address=pickup_addr_str,
             delivery_address=delivery_addr_str,
             delivery_time_iso=delivery_time_iso,
-            api_key=SHIPDAY_API_KEY_US,  # 👈 fuerza SIEMPRE API key USA como pediste
+            api_key=SHIPDAY_API_KEY_US,  # si quieres, aquí también puedes decidir la región por site
         )
 
         pickup_duration_minutes: Optional[int] = None
