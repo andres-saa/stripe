@@ -603,7 +603,7 @@ class ShipdayAvailabilityRequest(BaseModel):
 
 class ShipdayAvailabilityResponse(BaseModel):
     available: bool
-    availability: Optional[ShipdayAvailability] = None  # cuando hay Uber
+    availability: Optional[ShipdayAvailability] = None  # cuando hay Uber u otro
     shipday_payload: Optional[Dict[str, Any]] = None    # auditoría
     shipday_response: Optional[Any] = None              # respuesta cruda de Shipday
     shipday_requested_at_iso: str
@@ -656,6 +656,7 @@ async def shipday_availability(order_id: str):
     # 2) Determinar site y elegir la API key correcta (US o CO)
     site_id = (body or {}).get("site_id")
     api_key = select_shipday_api_key_for_site(site_id)
+    is_co_region = site_id not in US_SITE_IDS  # True => Colombia
 
     if (site_id in US_SITE_IDS and not SHIPDAY_API_KEY_US) or (site_id not in US_SITE_IDS and not SHIPDAY_API_KEY_COLOMBIA):
         region = "USA" if site_id in US_SITE_IDS else "COLOMBIA"
@@ -703,6 +704,7 @@ async def shipday_availability(order_id: str):
             api_key=api_key,                # 👈 ahora usa automáticamente US o CO según site
         )
 
+    # Caso normal: si encontramos proveedor preferido (p. ej., Uber)
     if isinstance(best, ShipdayAvailability):
         return ShipdayAvailabilityResponse(
             available=True,
@@ -713,7 +715,36 @@ async def shipday_availability(order_id: str):
             error=None,
         )
 
-    # Sin disponibilidad del proveedor preferido (o error)
+    # 🇨🇴 Fallback Colombia: cualquier fee (incluido 0) = disponible
+    if is_co_region and isinstance(raw, list):
+        co_any: Optional[ShipdayAvailability] = None
+        for item in raw:
+            if not item or item.get("error") is True:
+                continue
+            fee = item.get("fee")
+            # fee válido si es número, incluso 0
+            if isinstance(fee, (int, float)):
+                co_any = ShipdayAvailability(
+                    provider=_provider_name(item) or "desconocido",
+                    fee=float(fee),
+                    pickup_duration_minutes=_as_int(item.get("pickupDuration")),
+                    delivery_duration_minutes=_as_int(item.get("deliveryDuration")),
+                    pickup_time_iso=item.get("pickupTime"),
+                    delivery_time_iso=item.get("deliveryTime"),
+                )
+                break
+
+        if co_any:
+            return ShipdayAvailabilityResponse(
+                available=True,
+                availability=co_any,
+                shipday_payload=payload,
+                shipday_response=raw,
+                shipday_requested_at_iso=ts,
+                error=None,
+            )
+
+    # Sin disponibilidad del proveedor preferido (o sin fee en CO)
     return ShipdayAvailabilityResponse(
         available=False,
         availability=None,
