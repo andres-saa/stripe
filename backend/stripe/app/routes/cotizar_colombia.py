@@ -278,8 +278,8 @@ SEDES: List[Dict[str, Any]] = [
     },
     {
         "site_id": 3,
-        "site_name": "CANEY",
-        "site_address": "Carrera 85 #37-10, Caney, Cali, Valle del Cauca, Colombia",
+        "site_name": "BOCHALEMA",
+        "site_address": "Calle 48 # 106-83 Arbolatta mall LOCAL 10",
         "pe_site_id": 7,
         "time_zone": "America/Bogota",
         "location": None,
