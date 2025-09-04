@@ -6,7 +6,7 @@ import httpx
 from dotenv import load_dotenv
 import re
 import unicodedata
-from datetime import datetime, timezone  # ← para timestamps de auditoría Shipday
+from datetime import datetime, timezone  # timestamps de auditoría Shipday
 
 load_dotenv()
 
@@ -25,7 +25,7 @@ PLACES_COUNTRIES = os.getenv("PLACES_COUNTRIES_CO", "co")
 # =========================
 #  CONFIGURACIÓN DE PRECIOS
 # =========================
-# Norma:
+# Norma (todas las distancias en KM):
 #  0–BASE_DISTANCE_KM  -> BASE_PRICE_COP
 #  BASE_DISTANCE_KM–TIER1_MAX_KM: TIER1_RATE_PER_KM_COP por km adicional
 #  >TIER1_MAX_KM: TIER2_RATE_PER_KM_COP por km adicional extra
@@ -63,7 +63,7 @@ def _to_km_from_shipday(v: float) -> float:
     # Shipday devuelve 'distance' en millas o km dependiendo de la cuenta.
     if _units_is_km():
         return float(v)
-    # asume millas -> km
+    # millas -> km
     return float(v) * 1.609344
 
 # ======= NUEVO: disponibilidad Shipday (metadatos) =======
@@ -445,15 +445,15 @@ class GeocodedPoint(BaseModel):
 class DistanceResponse(BaseModel):
     origin: GeocodedPoint
     destination: GeocodedPoint
-    distance_miles: float
-    distance_km: float
-    method: str = "great_circle_haversine"
+    distance_km: float                          # SIEMPRE en kilómetros
+    distance_miles_driving: Optional[float] = None  # Solo si viene de ruta conducida (no haversine)
+    method: str = "google_distance_matrix_driving"
 
 class NearestInfo(BaseModel):
     site: Dict[str, Any]
-    distance_miles: float
+    distance_km: float                          # Distancia base (haversine) en km para selección
     in_coverage: bool
-    driving_distance_miles: Optional[float] = None
+    driving_distance_km: Optional[float] = None # Ruta conducida si se pudo calcular
 
 class AutocompleteLiteItem(BaseModel):
     description: str
@@ -477,7 +477,7 @@ class Address(BaseModel):
     zip: str
     country: str
 
-# ======= NUEVO: metadatos de disponibilidad Shipday =======
+# ======= Metadatos de disponibilidad Shipday =======
 class ShipdayAvailability(BaseModel):
     provider: str
     fee: float
@@ -498,10 +498,10 @@ class CoverageDetailsResponse(BaseModel):
     lng: float
     nearest: Optional[NearestInfo] = None
     delivery_cost_cop: Optional[int] = None
-    distance_km: Optional[float] = None
+    distance_km: Optional[float] = None          # Distancia de conducción reportada (o fallback) en km
     dropoff: Optional[Dropoff] = None
 
-    # ===== NUEVO: metadatos/auditoría Shipday (no afectan el precio) =====
+    # ===== Metadatos/auditoría Shipday (no afectan el precio) =====
     pickup_duration_minutes: Optional[int] = None
     delivery_duration_minutes: Optional[int] = None
     pickup_time_iso: Optional[str] = None
@@ -518,22 +518,28 @@ class ShipdayDistanceResponse(BaseModel):
     lat: float
     lng: float
     nearest: Optional[NearestInfo] = None
-    shipday_distance_value: Optional[float] = None   # valor tal como lo entrega Shipday (unidad de tu cuenta)
-    shipday_distance_units: Optional[str] = None     # 'km' o 'mi' (según SHIPDAY_DISTANCE_UNITS)
-    shipday_distance_km: Optional[float] = None      # normalizado a km
+    shipday_distance_km: Optional[float] = None          # Normalizado a km SIEMPRE
+    shipday_distance_miles_driving: Optional[float] = None  # Derivado de la ruta de Shipday (km->mi)
     error: Optional[CoverageError] = None
 
 # ─────────── Utilidades ───────────
 
 def haversine_miles(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """
+    Distancia del círculo máximo (no conducida) en millas.
+    (Fórmula corregida)
+    """
     R_miles = 3958.7613
     phi1 = math.radians(lat1)
     phi2 = math.radians(lat2)
     dphi = math.radians(lat2 - lat1)
     dlambda = math.radians(lon2 - lon1)
-    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) ** 2 * math.sin(dlambda / 2) ** 2
+    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * (math.sin(dlambda / 2) ** 2)
     c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
     return R_miles * c
+
+def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    return haversine_miles(lat1, lon1, lat2, lon2) * 1.609344
 
 async def geocode_address_with_components(client: httpx.AsyncClient, address: str, countries: Optional[str] = None) -> Tuple[float, float, str, List[Dict[str, Any]]]:
     if not GOOGLE_API_KEY:
@@ -650,14 +656,18 @@ def _build_address_from_components(comps: List[Dict[str, Any]]) -> Tuple['Addres
 
     return addr, raw_address
 
-async def driving_distance_miles(client: httpx.AsyncClient, o_lat: float, o_lng: float, d_lat: float, d_lng: float, language: str = "es") -> Tuple[float, int]:
+async def driving_distance_km(client: httpx.AsyncClient, o_lat: float, o_lng: float, d_lat: float, d_lng: float, language: str = "es") -> Tuple[float, int]:
+    """
+    Distancia de conducción en KM usando Google Distance Matrix.
+    Retorna (kilómetros, segundos_estimados).
+    """
     if not GOOGLE_API_KEY:
         raise HTTPException(status_code=500, detail="No se configuró GOOGLE_MAPS_API_KEY")
     params = {
         "origins": f"{o_lat},{o_lng}",
         "destinations": f"{d_lat},{d_lng}",
         "mode": "driving",
-        "units": "metric",  # el value siempre viene en metros; 'units' solo afecta el texto
+        "units": "metric",  # value = metros; 'units' solo afecta string
         "language": language,
         "key": GOOGLE_API_KEY,
     }
@@ -673,8 +683,8 @@ async def driving_distance_miles(client: httpx.AsyncClient, o_lat: float, o_lng:
         raise HTTPException(status_code=400, detail=f"Distance Matrix element: {el.get('status')}")
     meters  = el["distance"]["value"]
     seconds = el["duration"]["value"]
-    miles   = meters / 1609.344
-    return float(miles), int(seconds)
+    km      = meters / 1000.0
+    return float(km), int(seconds)
 
 # =============== PRECIO POR TRAMOS =================
 
@@ -690,11 +700,7 @@ def _billable_units(x: float, mode: str) -> int:
 
 def compute_delivery_cost_cop(distance_km: float) -> int:
     """
-    Calcula el costo de domicilio en COP según los tramos configurados.
-    - Base: hasta BASE_DISTANCE_KM → BASE_PRICE_COP
-    - Tramo 1: (BASE_DISTANCE_KM, TIER1_MAX_KM] → TIER1_RATE_PER_KM_COP por km adicional
-    - Tramo 2: (TIER1_MAX_KM, ∞) → TIER2_RATE_PER_KM_COP por km adicional
-    Billeo por km según DISTANCE_BILLING_MODE ('ceil' por defecto).
+    Calcula el costo de domicilio en COP según los tramos configurados (todo en KM).
     """
     if distance_km <= 0:
         return BASE_PRICE_COP
@@ -731,6 +737,7 @@ def nearest_among_same_city(lat: float, lng: float, city_norm: str) -> NearestIn
     """
     Selecciona SIEMPRE la sede más cercana (Haversine) ENTRE las sedes cuya ciudad normalizada
     coincide con la ciudad del dropoff. Si no hay coincidencias, in_coverage=False.
+    Devuelve distancia en KM (no conducida) solo para elegir sede.
     """
     best = None
     best_dist = float("inf")
@@ -741,13 +748,13 @@ def nearest_among_same_city(lat: float, lng: float, city_norm: str) -> NearestIn
         if s_city_norm and s_city_norm == city_norm:
             slat = s["location"]["lat"]
             slng = s["location"]["long"]
-            d = haversine_miles(lat, lng, slat, slng)
-            if d < best_dist:
-                best_dist = d
+            d_km = haversine_km(lat, lng, slat, slng)
+            if d_km < best_dist:
+                best_dist = d_km
                 best = s
     if best is None:
-        return NearestInfo(site={}, distance_miles=float("inf"), in_coverage=False)
-    return NearestInfo(site=best, distance_miles=round(best_dist, 2), in_coverage=True)
+        return NearestInfo(site={}, distance_km=float("inf"), in_coverage=False)
+    return NearestInfo(site=best, distance_km=round(best_dist, 2), in_coverage=True)
 
 def make_out_of_coverage_error_by_city(city: str) -> CoverageError:
     city_txt = city or "la ciudad indicada"
@@ -810,7 +817,7 @@ async def _shipday_fetch_distance_by_order_number(
     order_number: str
 ) -> float:
     """
-    Lee /orders/{orderNumber} y toma el 'distance' del primer objeto.
+    Lee /orders/{orderNumber} y toma el 'distance' del primer objeto (unidad de la cuenta).
     """
     url = f"https://api.shipday.com/orders/{order_number}"
     headers = _shipday_headers()
@@ -865,7 +872,12 @@ async def _shipday_probe_distance(
         await _shipday_delete_order(client, order_id)
     return float(distance_raw), _to_km_from_shipday(distance_raw)
 
-# ======= NUEVO: helper para metadatos de disponibilidad Shipday por direcciones =======
+# ======= helper para metadatos de disponibilidad Shipday por direcciones =======
+class _SDDeliveryQuote(BaseModel):
+    pickupAddress: str
+    deliveryAddress: str
+    deliveryTime: Optional[str] = None
+
 async def shipday_quote_meta_by_address(
     client: httpx.AsyncClient,
     pickup_address: str,
@@ -975,12 +987,13 @@ async def coverage_details(
     place_id: str = Query(..., description="Place ID seleccionado por el usuario"),
     session_token: Optional[str] = Query(None, description="Token de sesión usado en Autocomplete"),
     language: str = Query("es", description="Idioma para Distance Matrix"),
-    delivery_time_iso: Optional[str] = Query(None, description="Hora de entrega ISO-8601 (UTC), opcional para Shipday")  # NUEVO
+    delivery_time_iso: Optional[str] = Query(None, description="Hora de entrega ISO-8601 (UTC), opcional para Shipday")
 ):
     """
     Cobertura por CIUDAD (precio por tramos en COP) + metadatos Shipday (opcional).
     - Precio se calcula SIEMPRE con compute_delivery_cost_cop(distance_km).
     - Shipday solo aporta tiempos/fechas y auditoría; su 'fee' NO se usa para cobrar.
+    - Todas las distancias de respuesta se reportan en KM; cuando haya millas, son millas conducidas derivadas.
     """
     async with httpx.AsyncClient() as client:
         # 0) Asegurar datos de sedes (coords + city_norm)
@@ -1018,20 +1031,20 @@ async def coverage_details(
                 error=make_out_of_coverage_error_by_city(address.city),
             )
 
-        # 4) Dentro de cobertura (misma ciudad) → calcular distancia por carretera si es posible
+        # 4) Dentro de cobertura (misma ciudad) → calcular distancia de conducción cuando sea posible
         s = near.site["location"]
         try:
-            driving_miles, _ = await driving_distance_miles(client, s["lat"], s["long"], dlat, dlng, language=language)
-            near.driving_distance_miles = round(driving_miles, 2)
-            distance_km = driving_miles * 1.609344
+            driving_km, _ = await driving_distance_km(client, s["lat"], s["long"], dlat, dlng, language=language)
+            near.driving_distance_km = round(driving_km, 2)
+            distance_km = driving_km
         except Exception:
-            # Fallback Haversine
-            distance_km = near.distance_miles * 1.609344
+            # Fallback Haversine (no conducido, solo para no romper)
+            distance_km = near.distance_km
 
         # Redondeo de reporte (solo visual)
         distance_km_report = round(distance_km, DISTANCE_REPORT_DECIMALS)
 
-        # 5) Calcular costo por tramos (SE MANTIENE TAL CUAL)
+        # 5) Calcular costo por tramos (SE MANTIENE TAL CUAL, usando KM)
         delivery_cost = compute_delivery_cost_cop(distance_km)
 
         # 6) (Opcional) Consultar metadatos de disponibilidad en Shipday — NO afecta el precio
@@ -1069,7 +1082,7 @@ async def coverage_details(
         lat=dlat,
         lng=dlng,
         nearest=near,                          # sede asignada más cercana en la ciudad
-        delivery_cost_cop=delivery_cost,       # costo por tramos (SE MANTIENE)
+        delivery_cost_cop=delivery_cost,       # costo por tramos
         distance_km=distance_km_report,        # distancia (km) reportada
         dropoff=dropoff,
         # ===== Metadatos/auditoría Shipday (opcionales) =====
@@ -1097,6 +1110,11 @@ async def compute_distance(
     body: DistanceRequest,
     method: str = Query("driving", pattern=r"^(haversine|driving)$")
 ):
+    """
+    Calcula distancia entre origen y destino.
+    - 'driving' (por defecto): usa Google Distance Matrix → distance_km y distance_miles_driving.
+    - 'haversine' : sólo para fallback; reporta distance_km y NO incluye miles (porque no son conducidas).
+    """
     # Resolver origen/destino
     async with httpx.AsyncClient() as client:
         if body.origin_place_id:
@@ -1118,14 +1136,17 @@ async def compute_distance(
             raise HTTPException(status_code=422, detail="Debes enviar destination o destination_place_id")
 
     # Calcular distancia según método
+    distance_km = 0.0
+    distance_miles_driving: Optional[float] = None
     if method == "driving":
         async with httpx.AsyncClient() as client:
-            miles, _secs = await driving_distance_miles(client, olat, olng, dlat, dlng)
-        km = miles * 1.609344
+            km, _secs = await driving_distance_km(client, olat, olng, dlat, dlng)
+        distance_km = km
+        distance_miles_driving = round(km / 1.609344, 2)
         used_method = "google_distance_matrix_driving"
     else:
-        miles = haversine_miles(olat, olng, dlat, dlng)
-        km = miles * 1.609344
+        km = haversine_km(olat, olng, dlat, dlng)
+        distance_km = km
         used_method = "great_circle_haversine"
 
     origin_gc = GeocodedPoint(query=oquery, formatted_address=ofmt, lat=olat, lng=olng)
@@ -1134,12 +1155,12 @@ async def compute_distance(
     return DistanceResponse(
         origin=origin_gc,
         destination=destination_gc,
-        distance_miles=round(miles, 2),
-        distance_km=round(km, 2),
+        distance_km=round(distance_km, 2),
+        distance_miles_driving=distance_miles_driving,
         method=used_method,
     )
 
-# ======= NUEVO ENDPOINT: distancia desde Shipday (pickup = sede asignada en misma ciudad) =======
+# ======= ENDPOINT: distancia desde Shipday (pickup = sede asignada en misma ciudad) =======
 @router.get("/shipday/distance", response_model=ShipdayDistanceResponse)
 async def shipday_distance_from_nearest_site(
     place_id: str = Query(..., description="Place ID del destino (cliente)"),
@@ -1147,8 +1168,10 @@ async def shipday_distance_from_nearest_site(
     language: str = Query("es", description="Idioma (no afecta Shipday)"),
 ):
     """
-    Usa la sede más cercana dentro de la MISMA CIUDAD (como tu cobertura) y consulta a Shipday
-    la distancia de conducción entre esa sede (pickup) y el destino (dropoff). NO calcula precio.
+    Usa la sede más cercana dentro de la MISMA CIUDAD (tu cobertura) y consulta a Shipday
+    la distancia de conducción entre esa sede (pickup) y el destino (dropoff).
+    - Respuesta SIEMPRE en KM; adicionalmente, 'shipday_distance_miles_driving' derivada (km→mi).
+    - No calcula precio (sólo distancia de Shipday).
     """
     if not SHIPDAY_API_KEY_COLOMBIA:
         raise HTTPException(status_code=500, detail="No se configuró SHIPDAY_API_KEY_COLOMBIA")
@@ -1196,8 +1219,7 @@ async def shipday_distance_from_nearest_site(
         lat=dlat,
         lng=dlng,
         nearest=near,
-        shipday_distance_value=round(dist_raw, 3),
-        shipday_distance_units=("km" if _units_is_km() else "mi"),
-        shipday_distance_km=round(dist_km, 3),
+        shipday_distance_km=round(dist_km, 3),                         # km siempre
+        shipday_distance_miles_driving=round(dist_km / 1.609344, 3),   # millas conducidas derivadas
         error=None
     )
