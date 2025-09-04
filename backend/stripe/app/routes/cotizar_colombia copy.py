@@ -498,7 +498,7 @@ class CoverageDetailsResponse(BaseModel):
     lng: float
     nearest: Optional[NearestInfo] = None
     delivery_cost_cop: Optional[int] = None
-    distance_miles: Optional[float] = None          # Distancia de conducción reportada (o fallback) en km
+    distance_km: Optional[float] = None          # Distancia de conducción reportada (o fallback) en km
     dropoff: Optional[Dropoff] = None
 
     # ===== Metadatos/auditoría Shipday (no afectan el precio) =====
@@ -1083,7 +1083,7 @@ async def coverage_details(
         lng=dlng,
         nearest=near,                          # sede asignada más cercana en la ciudad
         delivery_cost_cop=delivery_cost,       # costo por tramos
-        distance_miles=distance_km_report,        # distancia (km) reportada
+        distance_km=distance_km_report,        # distancia (km) reportada
         dropoff=dropoff,
         # ===== Metadatos/auditoría Shipday (opcionales) =====
         pickup_duration_minutes=pickup_duration_minutes,
