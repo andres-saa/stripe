@@ -128,7 +128,7 @@ SEDES: List[Dict[str, Any]] = [
         "site_id": 2,
         "site_name": "ACOPI YUMBO",
         "site_address": "Carrera 32 #8-42, ACOPI Yumbo, Yumbo, Valle del Cauca, Colombia",
-        "pe_site_id": 12,
+        "pe_site_id": 1,
         "time_zone": "America/Bogota",
         "location": None,
         "city": None,
