@@ -124,25 +124,7 @@ SEDES: List[Dict[str, Any]] = [
             }
         },
     },
-    {
-        "site_id": 32,
-        "site_name": "ACOPI YUMBO",
-        "site_address": "Carrera 32 #8-42, ACOPI Yumbo, Yumbo, Valle del Cauca, Colombia",
-        "pe_site_id": 12,
-        "time_zone": "America/Bogota",
-        "location": None,
-        "city": None,
-        "pickup": {
-            "address": {
-                "zip": None,
-                "city": "Yumbo",
-                "unit": None,
-                "state": "Valle del Cauca",
-                "street": "Carrera 32 #8-42",
-                "country": "CO",
-            }
-        },
-    },
+   
     {
         "site_id": 4,
         "site_name": "JAMUNDI",
@@ -371,10 +353,7 @@ CITY_CHILDREN_CO: Dict[str, Dict[str, set]] = {
             "caney","ciudad jardin","napoles","el ingenio","pance","el prado"
         }
     },
-    "yumbo": {
-        "aliases": {"yumbo"},
-        "children": {"acopi","acopi yumbo","la estancia","las américas","bellavista","urbanizacion acopi"}
-    },
+
     "jamundi": {
         "aliases": {"jamundi","jamundí"},
         "children": {"alfaguara","potrerito","robles"}
