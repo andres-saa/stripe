@@ -50,6 +50,13 @@ DISTANCE_REPORT_DECIMALS = int(os.getenv("DISTANCE_REPORT_DECIMALS", "2"))
 # Países permitidos para Places (puedes ampliar si quieres)
 PLACES_COUNTRIES = os.getenv("PLACES_COUNTRIES", "us")  # p.ej. "us" o "us|pr"
 
+# 👉 Nuevo: Límite de distancia por conducción (en millas)
+DRIVING_DISTANCE_MAX_MILES = float(os.getenv("DRIVING_DISTANCE_MAX_MILES", "8"))
+
+# 👉 Nuevo: Proveedor preferido/secundario (por defecto doordash -> uber)
+SHIPDAY_PREFERRED_PROVIDER = (os.getenv("SHIPDAY_PREFERRED_PROVIDER", "doordash")).strip().lower()
+SHIPDAY_SECONDARY_PROVIDER = (os.getenv("SHIPDAY_SECONDARY_PROVIDER", "uber")).strip().lower()
+
 router = APIRouter()
 
 # ─────────── SEDES (USA) ───────────
@@ -480,8 +487,6 @@ async def driving_distance_miles(
 
 # ─────────── Shipday helpers ───────────
 
-SHIPDAY_PREFERRED_PROVIDER = (os.getenv("SHIPDAY_PREFERRED_PROVIDER", "uber")).strip().lower()
-
 def _shipday_auth_value(api_key_override: Optional[str] = None) -> str:
     """
     Devuelve el valor de Authorization para Shipday.
@@ -529,10 +534,12 @@ async def shipday_quote_fee_by_address(
     delivery_address: str,
     delivery_time_iso: Optional[str] = None,
     preferred_provider: Optional[str] = None,
-    api_key: Optional[str] = None,  # 👈 ahora se puede inyectar la key a usar
+    secondary_provider: Optional[str] = None,
+    api_key: Optional[str] = None,  # 👈 se puede inyectar la key a usar
 ) -> Tuple[Optional[ShipdayAvailability], Optional[Dict[str, Any]], Optional[Any], str]:
     """
     Devuelve (best_availability, payload_enviado, respuesta_cruda, timestamp_iso_utc)
+    Selecciona primero el proveedor preferido (p.ej. doordash) y si no hay, intenta con el secundario (p.ej. uber).
     """
     ts_iso = datetime.now(timezone.utc).isoformat()
     if not api_key:
@@ -572,27 +579,33 @@ async def shipday_quote_fee_by_address(
     if not isinstance(data, list):
         return None, payload, data, ts_iso
 
-    preferred = (preferred_provider or SHIPDAY_PREFERRED_PROVIDER or "uber").strip().lower()
+    preferred = (preferred_provider or SHIPDAY_PREFERRED_PROVIDER or "doordash").strip().lower()
+    secondary = (secondary_provider or SHIPDAY_SECONDARY_PROVIDER or "uber").strip().lower()
 
-    best: Optional[ShipdayAvailability] = None
-    for item in data:
-        if not item or item.get("error") is True:
-            continue
-        fee = item.get("fee")
-        if not isinstance(fee, (int, float)):
-            continue
-        if preferred in _provider_name(item):
-            current = ShipdayAvailability(
-                provider=preferred,
-                fee=float(fee),
-                pickup_duration_minutes=_as_int(item.get("pickupDuration")),
-                delivery_duration_minutes=_as_int(item.get("deliveryDuration")),
-                pickup_time_iso=item.get("pickupTime"),
-                delivery_time_iso=item.get("deliveryTime"),
-            )
-            if best is None or current.fee < best.fee:
-                best = current
+    def _best_for(name: str) -> Optional[ShipdayAvailability]:
+        best: Optional[ShipdayAvailability] = None
+        for item in data:
+            if not item or item.get("error") is True:
+                continue
+            fee = item.get("fee")
+            if not isinstance(fee, (int, float)):
+                continue
+            prov = _provider_name(item)
+            if name in prov:
+                current = ShipdayAvailability(
+                    provider=name,
+                    fee=float(fee),
+                    pickup_duration_minutes=_as_int(item.get("pickupDuration")),
+                    delivery_duration_minutes=_as_int(item.get("deliveryDuration")),
+                    pickup_time_iso=item.get("pickupTime"),
+                    delivery_time_iso=item.get("deliveryTime"),
+                )
+                if best is None or current.fee < best.fee:
+                    best = current
+        return best
 
+    # Intentar preferido, luego secundario
+    best = _best_for(preferred) or _best_for(secondary)
     return best, payload, data, ts_iso
 
 
@@ -603,10 +616,10 @@ class ShipdayAvailabilityRequest(BaseModel):
 
 class ShipdayAvailabilityResponse(BaseModel):
     available: bool
-    availability: Optional[ShipdayAvailability] = None  # cuando hay Uber u otro
+    availability: Optional[ShipdayAvailability] = None  # cuando hay DoorDash/Uber u otro
     shipday_payload: Optional[Dict[str, Any]] = None    # auditoría
     shipday_response: Optional[Any] = None              # respuesta cruda de Shipday
-    shipday_requested_at_iso: str
+    shipday_requested_at_iso: Optional[str] = None
     error: Optional[CoverageError] = None
 
 # ─────────── Selección de API key por site ───────────
@@ -628,8 +641,10 @@ def select_shipday_api_key_for_site(site_id: Optional[int]) -> Optional[str]:
 @router.post("/shipday/availability/{order_id}", response_model=ShipdayAvailabilityResponse)
 async def shipday_availability(order_id: str):
     """
-    Consulta disponibilidad (preferencia: Uber) en Shipday entre dos direcciones (pickup y delivery),
+    Consulta disponibilidad (preferencia: DoorDash, fallback: Uber) en Shipday entre dos direcciones (pickup y delivery),
     eligiendo AUTOMÁTICAMENTE la API key (USA o COLOMBIA) según el site de la orden (derivado del order_id).
+    ➜ Si la distancia por conducción supera DRIVING_DISTANCE_MAX_MILES, retorna available=False
+       y deja todos los campos de Shipday en null, aunque Shipday reporte disponibilidad.
     """
     # 1) Obtener orden desde tu backend
     body = None
@@ -694,17 +709,45 @@ async def shipday_availability(order_id: str):
             ),
         )
 
+    # 3.1) 👉 Calcular distancia por conducción y aplicar límite
+    over_limit = False
+    try:
+        async with httpx.AsyncClient() as client:
+            p_lat, p_lng, _ = await geocode_address(client, pickup_address)
+            d_lat, d_lng, _ = await geocode_address(client, delivery_address)
+            driving_miles, _secs = await driving_distance_miles(client, p_lat, p_lng, d_lat, d_lng)
+        over_limit = driving_miles > DRIVING_DISTANCE_MAX_MILES
+    except Exception:
+        # Si no se puede calcular, no bloqueamos por límite
+        over_limit = False
+
+    if over_limit:
+        # Sobre el límite: forzamos "no disponible" y Shipday en null
+        return ShipdayAvailabilityResponse(
+            available=False,
+            availability=None,
+            shipday_payload=None,
+            shipday_response=None,
+            shipday_requested_at_iso=None,
+            error=CoverageError(
+                code="OVER_DISTANCE_LIMIT",
+                message_es=f"La distancia por conducción excede el límite de {DRIVING_DISTANCE_MAX_MILES:.2f} millas.",
+                message_en=f"Driving distance exceeds the {DRIVING_DISTANCE_MAX_MILES:.2f}-mile limit.",
+            ),
+        )
+
     # 4) Consultar disponibilidad en Shipday con la API key elegida
     async with httpx.AsyncClient() as client:
         best, payload, raw, ts = await shipday_quote_fee_by_address(
             client=client,
             pickup_address=pickup_address,
             delivery_address=delivery_address,
-            preferred_provider="uber",      # 👈 preferimos Uber (ajustable por env)
-            api_key=api_key,                # 👈 ahora usa automáticamente US o CO según site
+            preferred_provider=SHIPDAY_PREFERRED_PROVIDER,   # 👉 DoorDash por defecto
+            secondary_provider=SHIPDAY_SECONDARY_PROVIDER,   # 👉 Uber como fallback
+            api_key=api_key,                                 # 👉 key US o CO según site
         )
 
-    # Caso normal: si encontramos proveedor preferido (p. ej., Uber)
+    # Caso normal: si encontramos proveedor preferido o secundario
     if isinstance(best, ShipdayAvailability):
         return ShipdayAvailabilityResponse(
             available=True,
@@ -715,14 +758,13 @@ async def shipday_availability(order_id: str):
             error=None,
         )
 
-    # 🇨🇴 Fallback Colombia: cualquier fee (incluido 0) = disponible
+    # 🇨🇴 Fallback Colombia: si no hay preferido/secundario, se permite "cualquier fee" (incluido 0)
     if is_co_region and isinstance(raw, list):
         co_any: Optional[ShipdayAvailability] = None
         for item in raw:
             if not item or item.get("error") is True:
                 continue
             fee = item.get("fee")
-            # fee válido si es número, incluso 0
             if isinstance(fee, (int, float)):
                 co_any = ShipdayAvailability(
                     provider=_provider_name(item) or "desconocido",
@@ -744,7 +786,7 @@ async def shipday_availability(order_id: str):
                 error=None,
             )
 
-    # Sin disponibilidad del proveedor preferido (o sin fee en CO)
+    # Sin disponibilidad
     return ShipdayAvailabilityResponse(
         available=False,
         availability=None,
@@ -753,8 +795,8 @@ async def shipday_availability(order_id: str):
         shipday_requested_at_iso=ts,
         error=CoverageError(
             code="NO_PREFERRED_PROVIDER_AVAILABLE",
-            message_es="No hay disponibilidad con el proveedor preferido para estas direcciones.",
-            message_en="No preferred provider availability for these addresses.",
+            message_es="No hay disponibilidad con DoorDash o Uber para estas direcciones.",
+            message_en="No availability with DoorDash or Uber for these addresses.",
         ),
     )
 
@@ -763,7 +805,7 @@ async def shipday_quote_fee(
     client: httpx.AsyncClient,
     pickup_lat: float, pickup_lng: float,
     drop_lat: float, drop_lng: float,
-    api_key: Optional[str] = None,  # 👈 ahora se puede inyectar la key
+    api_key: Optional[str] = None,  # 👈 se puede inyectar la key
 ) -> Optional[float]:
     headers = {
         "Authorization": _shipday_auth_value(api_key),
@@ -794,19 +836,23 @@ async def shipday_quote_fee(
         return None
 
     preferred = SHIPDAY_PREFERRED_PROVIDER
+    secondary = SHIPDAY_SECONDARY_PROVIDER
 
-    uber_fees: List[float] = []
-    for item in data:
-        if not item or item.get("error") is True:
-            continue
-        fee = item.get("fee")
-        if not isinstance(fee, (int, float)):
-            continue
-        name = _provider_name(item)
-        if preferred in name:
-            uber_fees.append(float(fee))
+    def _fees_for(name: str) -> List[float]:
+        out: List[float] = []
+        for item in data:
+            if not item or item.get("error") is True:
+                continue
+            fee = item.get("fee")
+            if not isinstance(fee, (int, float)):
+                continue
+            prov = _provider_name(item)
+            if name in prov:
+                out.append(float(fee))
+        return out
 
-    return min(uber_fees) if uber_fees else None
+    fees = _fees_for(preferred) or _fees_for(secondary)
+    return min(fees) if fees else None
 
 # ─────────── Helpers Autocomplete ───────────
 
@@ -1125,14 +1171,25 @@ async def coverage_details(
         pickup_addr_str   = _site_pickup_address_str(near.site)
         delivery_addr_str = strict_label
 
-        # 👇 obtenemos disponibilidad + payload + respuesta + timestamp
-        sd, sd_payload, sd_raw, sd_ts = await shipday_quote_fee_by_address(
-            client,
-            pickup_address=pickup_addr_str,
-            delivery_address=delivery_addr_str,
-            delivery_time_iso=delivery_time_iso,
-            api_key=SHIPDAY_API_KEY_US,  # si quieres, aquí también puedes decidir la región por site
-        )
+        # 👉 Si excede el límite, NO consultamos Shipday y dejamos campos Shipday en null
+        over_limit = (near.driving_distance_miles is not None and near.driving_distance_miles > DRIVING_DISTANCE_MAX_MILES)
+
+        if over_limit:
+            sd = None
+            sd_payload = None
+            sd_raw = None
+            sd_ts = None
+        else:
+            # 👇 obtenemos disponibilidad + payload + respuesta + timestamp (DoorDash -> Uber)
+            sd, sd_payload, sd_raw, sd_ts = await shipday_quote_fee_by_address(
+                client,
+                pickup_address=pickup_addr_str,
+                delivery_address=delivery_addr_str,
+                delivery_time_iso=delivery_time_iso,
+                preferred_provider=SHIPDAY_PREFERRED_PROVIDER,
+                secondary_provider=SHIPDAY_SECONDARY_PROVIDER,
+                api_key=SHIPDAY_API_KEY_US,  # si quieres, aquí también puedes decidir la región por site
+            )
 
         pickup_duration_minutes: Optional[int] = None
         delivery_duration_minutes: Optional[int] = None
@@ -1154,6 +1211,15 @@ async def coverage_details(
                 base_cost = max(base_cost, DELIVERY_MIN_USD_OUT_OF_COVERAGE)
             cost_int = int(math.ceil(base_cost))
 
+        # Armar respuesta
+        err_obj: Optional[CoverageError] = None
+        if over_limit:
+            err_obj = CoverageError(
+                code="OVER_DISTANCE_LIMIT",
+                message_es=f"La distancia por conducción excede el límite de {DRIVING_DISTANCE_MAX_MILES:.2f} millas.",
+                message_en=f"Driving distance exceeds the {DRIVING_DISTANCE_MAX_MILES:.2f}-mile limit.",
+            )
+
     return CoverageDetailsResponse(
         place_id=place_id,
         formatted_address=strict_label,
@@ -1167,10 +1233,10 @@ async def coverage_details(
         delivery_duration_minutes=delivery_duration_minutes,
         pickup_time_iso=pickup_time_iso,
         delivery_time_iso=delivery_time_iso_out,
-        shipday_payload=sd_payload,
-        shipday_response=sd_raw,
-        shipday_requested_at_iso=sd_ts,
-        error=None
+        shipday_payload=sd_payload if not over_limit else None,
+        shipday_response=sd_raw if not over_limit else None,
+        shipday_requested_at_iso=sd_ts if not over_limit else None,
+        error=err_obj
     )
 
 @router.post("/distance", response_model=DistanceResponse)
