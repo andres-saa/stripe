@@ -643,8 +643,10 @@ async def shipday_availability(order_id: str):
     """
     Consulta disponibilidad (preferencia: DoorDash, fallback: Uber) en Shipday entre dos direcciones (pickup y delivery),
     eligiendo AUTOMÁTICAMENTE la API key (USA o COLOMBIA) según el site de la orden (derivado del order_id).
-    ➜ Si la distancia por conducción supera DRIVING_DISTANCE_MAX_MILES, retorna available=False
-       y deja todos los campos de Shipday en null, aunque Shipday reporte disponibilidad.
+    ➜ Si la distancia por conducción supera DRIVING_DISTANCE_MAX_MILES:
+       - NO se consulta Shipday
+       - NO se devuelve error
+       - Se responde available=False y campos Shipday en null
     """
     # 1) Obtener orden desde tu backend
     body = None
@@ -671,7 +673,6 @@ async def shipday_availability(order_id: str):
     # 2) Determinar site y elegir la API key correcta (US o CO)
     site_id = (body or {}).get("site_id")
     api_key = select_shipday_api_key_for_site(site_id)
-    is_co_region = site_id not in US_SITE_IDS  # True => Colombia
 
     if (site_id in US_SITE_IDS and not SHIPDAY_API_KEY_US) or (site_id not in US_SITE_IDS and not SHIPDAY_API_KEY_COLOMBIA):
         region = "USA" if site_id in US_SITE_IDS else "COLOMBIA"
@@ -722,18 +723,14 @@ async def shipday_availability(order_id: str):
         over_limit = False
 
     if over_limit:
-        # Sobre el límite: forzamos "no disponible" y Shipday en null
+        # Sobre el límite: NO usamos Shipday y NO devolvemos error
         return ShipdayAvailabilityResponse(
             available=False,
             availability=None,
             shipday_payload=None,
             shipday_response=None,
             shipday_requested_at_iso=None,
-            error=CoverageError(
-                code="OVER_DISTANCE_LIMIT",
-                message_es=f"La distancia por conducción excede el límite de {DRIVING_DISTANCE_MAX_MILES:.2f} millas.",
-                message_en=f"Driving distance exceeds the {DRIVING_DISTANCE_MAX_MILES:.2f}-mile limit.",
-            ),
+            error=None,
         )
 
     # 4) Consultar disponibilidad en Shipday con la API key elegida
@@ -757,34 +754,6 @@ async def shipday_availability(order_id: str):
             shipday_requested_at_iso=ts,
             error=None,
         )
-
-    # 🇨🇴 Fallback Colombia: si no hay preferido/secundario, se permite "cualquier fee" (incluido 0)
-    if is_co_region and isinstance(raw, list):
-        co_any: Optional[ShipdayAvailability] = None
-        for item in raw:
-            if not item or item.get("error") is True:
-                continue
-            fee = item.get("fee")
-            if isinstance(fee, (int, float)):
-                co_any = ShipdayAvailability(
-                    provider=_provider_name(item) or "desconocido",
-                    fee=float(fee),
-                    pickup_duration_minutes=_as_int(item.get("pickupDuration")),
-                    delivery_duration_minutes=_as_int(item.get("deliveryDuration")),
-                    pickup_time_iso=item.get("pickupTime"),
-                    delivery_time_iso=item.get("deliveryTime"),
-                )
-                break
-
-        if co_any:
-            return ShipdayAvailabilityResponse(
-                available=True,
-                availability=co_any,
-                shipday_payload=payload,
-                shipday_response=raw,
-                shipday_requested_at_iso=ts,
-                error=None,
-            )
 
     # Sin disponibilidad
     return ShipdayAvailabilityResponse(
@@ -1171,6 +1140,9 @@ async def coverage_details(
         pickup_addr_str   = _site_pickup_address_str(near.site)
         delivery_addr_str = strict_label
 
+        # Seleccionar API key según site (US vs CO)
+        api_key_for_near = select_shipday_api_key_for_site(near.site.get("site_id"))
+
         # 👉 Si excede el límite, NO consultamos Shipday y dejamos campos Shipday en null
         over_limit = (near.driving_distance_miles is not None and near.driving_distance_miles > DRIVING_DISTANCE_MAX_MILES)
 
@@ -1188,7 +1160,7 @@ async def coverage_details(
                 delivery_time_iso=delivery_time_iso,
                 preferred_provider=SHIPDAY_PREFERRED_PROVIDER,
                 secondary_provider=SHIPDAY_SECONDARY_PROVIDER,
-                api_key=SHIPDAY_API_KEY_US,  # si quieres, aquí también puedes decidir la región por site
+                api_key=api_key_for_near,
             )
 
         pickup_duration_minutes: Optional[int] = None
@@ -1204,21 +1176,15 @@ async def coverage_details(
             pickup_time_iso = sd.pickup_time_iso
             delivery_time_iso_out = sd.delivery_time_iso
         else:
-            # Fallback: USD 2 por milla conducida, con mínimo de USD 6 si NO hay cobertura
+            # Fallback manual SIEMPRE (incluye caso over_limit) con tarifa por milla
             miles_for_cost = float(near.driving_distance_miles or d_miles or 0.0)
             base_cost = miles_for_cost * DELIVERY_RATE_USD_PER_MILE
             if not near.in_coverage:
                 base_cost = max(base_cost, DELIVERY_MIN_USD_OUT_OF_COVERAGE)
             cost_int = int(math.ceil(base_cost))
 
-        # Armar respuesta
-        err_obj: Optional[CoverageError] = None
-        if over_limit:
-            err_obj = CoverageError(
-                code="OVER_DISTANCE_LIMIT",
-                message_es=f"La distancia por conducción excede el límite de {DRIVING_DISTANCE_MAX_MILES:.2f} millas.",
-                message_en=f"Driving distance exceeds the {DRIVING_DISTANCE_MAX_MILES:.2f}-mile limit.",
-            )
+        # 👉 SIN error cuando over_limit
+        err_obj = None
 
     return CoverageDetailsResponse(
         place_id=place_id,
