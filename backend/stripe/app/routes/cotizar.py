@@ -194,6 +194,64 @@ class ShipdayAvailability(BaseModel):
     pickup_time_iso: Optional[str] = None
     delivery_time_iso: Optional[str] = None
 
+# ─────────── Lista negra de ubicaciones (configurable) ───────────
+"""
+Cada regla puede usar:
+- name: etiqueta legible de la zona bloqueada (para mensajes)
+- state: restringe por estado (ej: "NY")
+- city: ciudad exacta (una sola)
+- city_in: lista de nombres de ciudad aceptados (cualquiera coincide)
+- zip_prefixes: lista de prefijos de ZIP (si el ZIP empieza con cualquiera, coincide)
+- contains: lista de fragmentos (minúsculas) a buscar en la etiqueta formateada (e.g. "new york, ny")
+"""
+BLACKLIST_LOCATIONS: List[Dict[str, Any]] = [
+    {
+        "name": "New York City (todos los boroughs)",
+        "state": "NY",
+        "city_in": ["New York", "Manhattan", "Brooklyn", "Queens", "Bronx", "Staten Island"],
+        "zip_prefixes": [],  # puedes agregar ["100", "101", "102"] si quieres por prefijo de ZIP
+        "contains": ["new york, ny", "brooklyn, ny", "queens, ny", "bronx, ny", "staten island, ny", "manhattan, ny"],
+    }
+]
+
+def _cf(s: Optional[str]) -> str:
+    return (s or "").strip().casefold()
+
+def _is_blacklisted_address(addr: Optional[Address], strict_label: str) -> Optional[str]:
+    label_cf = _cf(strict_label)
+    for rule in BLACKLIST_LOCATIONS:
+        name = rule.get("name") or "ZONA BLOQUEADA"
+        # contains en etiqueta
+        for frag in (rule.get("contains") or []):
+            if frag and frag in label_cf:
+                return name
+        if addr:
+            # estado (si está definido)
+            state_ok = True
+            if rule.get("state"):
+                state_ok = _cf(addr.state) == _cf(rule["state"])
+            if not state_ok:
+                continue
+            # city exacta
+            if rule.get("city") and _cf(addr.city) == _cf(rule["city"]):
+                return name
+            # city en lista
+            if rule.get("city_in"):
+                cities = [_cf(c) for c in rule["city_in"]]
+                if _cf(addr.city) in cities:
+                    return name
+            # prefijos de ZIP
+            if rule.get("zip_prefixes"):
+                z = _cf(addr.zip)
+                for pref in rule["zip_prefixes"]:
+                    if z.startswith(_cf(pref)):
+                        return name
+    return None
+
+def _is_blacklisted_string(address_str: str) -> Optional[str]:
+    # Detección simple por fragmentos en la cadena
+    return _is_blacklisted_address(None, address_str)
+
 # ─────────── Utilidades generales ───────────
 
 HOUSE_NUM_SEEDS = [100, 200, 500, 800, 1000, 1500, 2000, 2100, 2500]
@@ -321,7 +379,7 @@ def nearest_site_for(lat: float, lng: float, radius_miles: float = 1000.0) -> Ne
         if d < best_dist:
             best_dist = d
             best = s
-    # 🔒 Nunca fuera de cobertura (por ahora)
+    # 🔒 Por defecto en_coverage=True; se puede forzar a False si entra en blacklist
     return NearestInfo(site=best, distance_miles=round(best_dist, 2), in_coverage=True)
 
 def make_out_of_coverage_error_by_city(city: str) -> CoverageError:
@@ -647,6 +705,9 @@ async def shipday_availability(order_id: str):
        - NO se consulta Shipday
        - NO se devuelve error
        - Se responde available=False y campos Shipday en null
+    ➜ Si la dirección destino está en LISTA NEGRA:
+       - NO se consulta Shipday
+       - Se responde available=False y error OUT_OF_COVERAGE_BLACKLIST
     """
     # 1) Obtener orden desde tu backend
     body = None
@@ -710,12 +771,52 @@ async def shipday_availability(order_id: str):
             ),
         )
 
+    # 3.0) 👉 BLOQUEO por LISTA NEGRA (detección simple por cadena)
+    reason_blk = _is_blacklisted_string(delivery_address)
+    if reason_blk:
+        ts_iso = datetime.now(timezone.utc).isoformat()
+        return ShipdayAvailabilityResponse(
+            available=False,
+            availability=None,
+            shipday_payload=None,
+            shipday_response=None,
+            shipday_requested_at_iso=ts_iso,
+            error=CoverageError(
+                code="OUT_OF_COVERAGE_BLACKLIST",
+                message_es=f"No entregamos en esta zona (bloqueada): {reason_blk}.",
+                message_en=f"We don't deliver to this blocked area: {reason_blk}.",
+            ),
+        )
+
     # 3.1) 👉 Calcular distancia por conducción y aplicar límite
     over_limit = False
     try:
         async with httpx.AsyncClient() as client:
             p_lat, p_lng, _ = await geocode_address(client, pickup_address)
-            d_lat, d_lng, _ = await geocode_address(client, delivery_address)
+            d_lat, d_lng, d_label = await geocode_address(client, delivery_address)
+
+            # Chequeo de lista negra con Address (etiqueta estricta) — más robusto
+            reason_blk2 = _is_blacklisted_address(
+                Address(unit=None, street=d_label.split(",")[0], city=d_label.split(",")[1].strip().split(" ")[0],
+                        state=d_label.split(",")[2].strip().split(" ")[0], zip=d_label.split(",")[2].strip().split(" ")[1],
+                        country=d_label.split(",")[-1].strip()),
+                d_label
+            )
+            if reason_blk2:
+                ts_iso = datetime.now(timezone.utc).isoformat()
+                return ShipdayAvailabilityResponse(
+                    available=False,
+                    availability=None,
+                    shipday_payload=None,
+                    shipday_response=None,
+                    shipday_requested_at_iso=ts_iso,
+                    error=CoverageError(
+                        code="OUT_OF_COVERAGE_BLACKLIST",
+                        message_es=f"No entregamos en esta zona (bloqueada): {reason_blk2}.",
+                        message_en=f"We don't deliver to this blocked area: {reason_blk2}.",
+                    ),
+                )
+
             driving_miles, _secs = await driving_distance_miles(client, p_lat, p_lng, d_lat, d_lng)
         over_limit = driving_miles > DRIVING_DISTANCE_MAX_MILES
     except Exception:
@@ -1119,6 +1220,34 @@ async def coverage_details(
 
         strict_label = _address_to_str(address)
         dropoff = Dropoff(address=address)
+
+        # 👉 BLOQUEO por LISTA NEGRA (firme)
+        reason_blk = _is_blacklisted_address(address, strict_label)
+        if reason_blk:
+            near = nearest_site_for(dlat, dlng, radius_miles=coverage_radius_miles)
+            near.in_coverage = False
+            return CoverageDetailsResponse(
+                place_id=place_id,
+                formatted_address=strict_label,
+                lat=dlat,
+                lng=dlng,
+                nearest=near,
+                delivery_cost_cop=None,
+                distance_miles=None,
+                dropoff=dropoff,
+                pickup_duration_minutes=None,
+                delivery_duration_minutes=None,
+                pickup_time_iso=None,
+                delivery_time_iso=None,
+                shipday_payload=None,
+                shipday_response=None,
+                shipday_requested_at_iso=None,
+                error=CoverageError(
+                    code="OUT_OF_COVERAGE_BLACKLIST",
+                    message_es=f"No entregamos en esta zona (bloqueada): {reason_blk}.",
+                    message_en=f"We don't deliver to this blocked area: {reason_blk}.",
+                ),
+            )
 
         # Elegimos la sede más cercana para origen (sin bloquear por ciudad ni por distancia)
         near = nearest_site_for(dlat, dlng, radius_miles=coverage_radius_miles)
