@@ -783,8 +783,8 @@ async def shipday_availability(order_id: str):
             shipday_requested_at_iso=ts_iso,
             error=CoverageError(
                 code="OUT_OF_COVERAGE_BLACKLIST",
-                message_es=f"No entregamos en esta zona (bloqueada): {reason_blk}.",
-                message_en=f"We don't deliver to this blocked area: {reason_blk}.",
+                message_es=f"Fuera de covertura, pronto abriremos aqui.",
+                message_en=f"Out of coverage, we will open here soon",
             ),
         )
 
