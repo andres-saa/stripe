@@ -22,8 +22,10 @@ PLACES_DETAILS_URL      = "https://maps.googleapis.com/maps/api/place/details/js
 GEOCODE_URL             = "https://maps.googleapis.com/maps/api/geocode/json"
 DISTANCE_MATRIX_URL     = "https://maps.googleapis.com/maps/api/distancematrix/json"
 
-# Shipday
-# Mantén variables separadas para US y Colombia
+# >>> Cambio: Toggle global para activar/desactivar Shipday (por defecto DESACTIVADO)
+SHIPDAY_ENABLED = (os.getenv("SHIPDAY_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on"))
+
+# Shipday (se mantiene para poder reactivar con el toggle)
 SHIPDAY_API_KEY_US = (
     os.getenv("SHIPDAY_API_KEY")
     or os.getenv("SHIPDAY_APIKEY")
@@ -40,20 +42,20 @@ if not SHIPDAY_API_KEY_COLOMBIA:
 
 SHIPDAY_AVAILABILITY_URL = "https://api.shipday.com/on-demand/availability"
 
-# Fallback si Shipday no devuelve tarifa (USD por milla)
+# Cotizador simple por milla (fallback/único cuando SHIPDAY_ENABLED=False)
 DELIVERY_RATE_USD_PER_MILE = float(os.getenv("DELIVERY_RATE_USD_PER_MILE", "2.0"))
-# Mínimo cuando NO hay cobertura (aplica sólo en fallback)
+# Mínimo cuando NO hay cobertura (aplica a cálculo manual)
 DELIVERY_MIN_USD_OUT_OF_COVERAGE = float(os.getenv("DELIVERY_MIN_USD_OUT_OF_COVERAGE", "6.0"))
 
 # Decimales para reportar distancia
 DISTANCE_REPORT_DECIMALS = int(os.getenv("DISTANCE_REPORT_DECIMALS", "2"))
-# Países permitidos para Places (puedes ampliar si quieres)
+# Países permitidos para Places
 PLACES_COUNTRIES = os.getenv("PLACES_COUNTRIES", "us")  # p.ej. "us" o "us|pr"
 
-# 👉 Nuevo: Límite de distancia por conducción (en millas)
+# Límite de distancia por conducción (en millas) — relevante solo para Shipday
 DRIVING_DISTANCE_MAX_MILES = float(os.getenv("DRIVING_DISTANCE_MAX_MILES", "8"))
 
-# 👉 Nuevo: Proveedor preferido/secundario (por defecto doordash -> uber)
+# Proveedor preferido/secundario
 SHIPDAY_PREFERRED_PROVIDER = (os.getenv("SHIPDAY_PREFERRED_PROVIDER", "doordash")).strip().lower()
 SHIPDAY_SECONDARY_PROVIDER = (os.getenv("SHIPDAY_SECONDARY_PROVIDER", "uber")).strip().lower()
 
@@ -102,7 +104,7 @@ SEDES: List[Dict[str, Any]] = [
         "pe_site_id": 16,
         "location": {"lat": 40.71335, "long": -74.20744},
         "pickup": {
-            "address": {
+                "address": {
                 "zip": "07087",
                 "city": "Union City",
                 "unit": None,
@@ -195,21 +197,12 @@ class ShipdayAvailability(BaseModel):
     delivery_time_iso: Optional[str] = None
 
 # ─────────── Lista negra de ubicaciones (configurable) ───────────
-"""
-Cada regla puede usar:
-- name: etiqueta legible de la zona bloqueada (para mensajes)
-- state: restringe por estado (ej: "NY")
-- city: ciudad exacta (una sola)
-- city_in: lista de nombres de ciudad aceptados (cualquiera coincide)
-- zip_prefixes: lista de prefijos de ZIP (si el ZIP empieza con cualquiera, coincide)
-- contains: lista de fragmentos (minúsculas) a buscar en la etiqueta formateada (e.g. "new york, ny")
-"""
 BLACKLIST_LOCATIONS: List[Dict[str, Any]] = [
     {
         "name": "New York City (todos los boroughs)",
         "state": "NY",
         "city_in": ["New York", "Manhattan", "Brooklyn", "Queens", "Bronx", "Staten Island"],
-        "zip_prefixes": [],  # puedes agregar ["100", "101", "102"] si quieres por prefijo de ZIP
+        "zip_prefixes": [],
         "contains": ["new york, ny", "brooklyn, ny", "queens, ny", "bronx, ny", "staten island, ny", "manhattan, ny"],
     }
 ]
@@ -221,26 +214,21 @@ def _is_blacklisted_address(addr: Optional[Address], strict_label: str) -> Optio
     label_cf = _cf(strict_label)
     for rule in BLACKLIST_LOCATIONS:
         name = rule.get("name") or "ZONA BLOQUEADA"
-        # contains en etiqueta
         for frag in (rule.get("contains") or []):
             if frag and frag in label_cf:
                 return name
         if addr:
-            # estado (si está definido)
             state_ok = True
             if rule.get("state"):
                 state_ok = _cf(addr.state) == _cf(rule["state"])
             if not state_ok:
                 continue
-            # city exacta
             if rule.get("city") and _cf(addr.city) == _cf(rule["city"]):
                 return name
-            # city en lista
             if rule.get("city_in"):
                 cities = [_cf(c) for c in rule["city_in"]]
                 if _cf(addr.city) in cities:
                     return name
-            # prefijos de ZIP
             if rule.get("zip_prefixes"):
                 z = _cf(addr.zip)
                 for pref in rule["zip_prefixes"]:
@@ -249,7 +237,6 @@ def _is_blacklisted_address(addr: Optional[Address], strict_label: str) -> Optio
     return None
 
 def _is_blacklisted_string(address_str: str) -> Optional[str]:
-    # Detección simple por fragmentos en la cadena
     return _is_blacklisted_address(None, address_str)
 
 # ─────────── Utilidades generales ───────────
@@ -379,7 +366,6 @@ def nearest_site_for(lat: float, lng: float, radius_miles: float = 1000.0) -> Ne
         if d < best_dist:
             best_dist = d
             best = s
-    # 🔒 Por defecto en_coverage=True; se puede forzar a False si entra en blacklist
     return NearestInfo(site=best, distance_miles=round(best_dist, 2), in_coverage=True)
 
 def make_out_of_coverage_error_by_city(city: str) -> CoverageError:
@@ -414,10 +400,6 @@ def _components_for(countries: Optional[str] = None) -> Optional[str]:
     return "|".join(f"country:{c}" for c in norm)
 
 async def geocode_address(client: httpx.AsyncClient, address: str) -> Tuple[float, float, str]:
-    """
-    Geocodifica y devuelve SIEMPRE una etiqueta estricta: '123 Main St, City, ST 99999, US'.
-    Falla con 400 si no se puede construir.
-    """
     if not GOOGLE_API_KEY:
         raise HTTPException(status_code=500, detail="No se configuró GOOGLE_MAPS_API_KEY")
     params = {"address": address, "key": GOOGLE_API_KEY, "components": _components_for()}
@@ -444,9 +426,6 @@ async def places_details(
     place_id: str,
     session_token: Optional[str] = None
 ) -> Tuple[float, float, str]:
-    """
-    Resuelve SIEMPRE etiqueta estricta a partir de address_components.
-    """
     if not GOOGLE_API_KEY:
         raise HTTPException(status_code=500, detail="No se configuró GOOGLE_MAPS_API_KEY")
     params = {
@@ -514,7 +493,6 @@ async def driving_distance_miles(
     language: str = "es"
 ) -> Tuple[float, int]:
     if not GOOGLE_API_KEY:
-        # Corrección del mensaje para mantener consistencia
         raise HTTPException(status_code=500, detail="No se configuró GOOGLE_MAPS_API_KEY")
 
     params = {
@@ -543,13 +521,9 @@ async def driving_distance_miles(
     miles   = meters / 1609.344
     return float(miles), int(seconds)
 
-# ─────────── Shipday helpers ───────────
+# ─────────── Shipday helpers (se conservan para reactivar con el toggle) ───────────
 
 def _shipday_auth_value(api_key_override: Optional[str] = None) -> str:
-    """
-    Devuelve el valor de Authorization para Shipday.
-    Si api_key_override viene, se usa esa; de lo contrario se usa la de US por defecto.
-    """
     key = (api_key_override or SHIPDAY_API_KEY_US or "").strip()
     if not key:
         return ""
@@ -593,15 +567,10 @@ async def shipday_quote_fee_by_address(
     delivery_time_iso: Optional[str] = None,
     preferred_provider: Optional[str] = None,
     secondary_provider: Optional[str] = None,
-    api_key: Optional[str] = None,  # 👈 se puede inyectar la key a usar
+    api_key: Optional[str] = None,
 ) -> Tuple[Optional[ShipdayAvailability], Optional[Dict[str, Any]], Optional[Any], str]:
-    """
-    Devuelve (best_availability, payload_enviado, respuesta_cruda, timestamp_iso_utc)
-    Selecciona primero el proveedor preferido (p.ej. doordash) y si no hay, intenta con el secundario (p.ej. uber).
-    """
     ts_iso = datetime.now(timezone.utc).isoformat()
     if not api_key:
-        # Sin API key utilizable
         return None, None, None, ts_iso
 
     headers = {
@@ -662,7 +631,6 @@ async def shipday_quote_fee_by_address(
                     best = current
         return best
 
-    # Intentar preferido, luego secundario
     best = _best_for(preferred) or _best_for(secondary)
     return best, payload, data, ts_iso
 
@@ -670,26 +638,21 @@ async def shipday_quote_fee_by_address(
 class ShipdayAvailabilityRequest(BaseModel):
     pickup_address: str
     delivery_address: str
-    delivery_time_iso: Optional[str] = None  # opcional, ISO-8601 en UTC
+    delivery_time_iso: Optional[str] = None
 
 class ShipdayAvailabilityResponse(BaseModel):
     available: bool
-    availability: Optional[ShipdayAvailability] = None  # cuando hay DoorDash/Uber u otro
-    shipday_payload: Optional[Dict[str, Any]] = None    # auditoría
-    shipday_response: Optional[Any] = None              # respuesta cruda de Shipday
+    availability: Optional[ShipdayAvailability] = None
+    shipday_payload: Optional[Dict[str, Any]] = None
+    shipday_response: Optional[Any] = None
     shipday_requested_at_iso: Optional[str] = None
     error: Optional[CoverageError] = None
 
 # ─────────── Selección de API key por site ───────────
 
-US_SITE_IDS = {33, 35, 36, 37}  # amplía aquí si agregas más sedes US
+US_SITE_IDS = {33, 35, 36, 37}
 
 def select_shipday_api_key_for_site(site_id: Optional[int]) -> Optional[str]:
-    """
-    Devuelve la API key según el site_id (sin fallback entre regiones).
-    - Site en US_SITE_IDS  -> SHIPDAY_API_KEY_US
-    - Cualquier otro site  -> SHIPDAY_API_KEY_COLOMBIA
-    """
     if site_id in US_SITE_IDS:
         return SHIPDAY_API_KEY_US
     return SHIPDAY_API_KEY_COLOMBIA
@@ -699,16 +662,26 @@ def select_shipday_api_key_for_site(site_id: Optional[int]) -> Optional[str]:
 @router.post("/shipday/availability/{order_id}", response_model=ShipdayAvailabilityResponse)
 async def shipday_availability(order_id: str):
     """
-    Consulta disponibilidad (preferencia: DoorDash, fallback: Uber) en Shipday entre dos direcciones (pickup y delivery),
-    eligiendo AUTOMÁTICAMENTE la API key (USA o COLOMBIA) según el site de la orden (derivado del order_id).
-    ➜ Si la distancia por conducción supera DRIVING_DISTANCE_MAX_MILES:
-       - NO se consulta Shipday
-       - NO se devuelve error
-       - Se responde available=False y campos Shipday en null
-    ➜ Si la dirección destino está en LISTA NEGRA:
-       - NO se consulta Shipday
-       - Se responde available=False y error OUT_OF_COVERAGE_BLACKLIST
+    Si SHIPDAY_ENABLED=False -> responde inmediatamente con available=False y error=SHIPDAY_DISABLED.
+    Si SHIPDAY_ENABLED=True -> ejecuta el flujo normal (preferido DoorDash → fallback Uber), con
+    límite DRIVING_DISTANCE_MAX_MILES.
     """
+    # >>> Nuevo: cortocircuito cuando Shipday está deshabilitado
+    if not SHIPDAY_ENABLED:
+        ts_iso = datetime.now(timezone.utc).isoformat()
+        return ShipdayAvailabilityResponse(
+            available=False,
+            availability=None,
+            shipday_payload=None,
+            shipday_response=None,
+            shipday_requested_at_iso=ts_iso,
+            error=CoverageError(
+                code="SHIPDAY_DISABLED",
+                message_es="Shipday está deshabilitado. Usamos solo tarifa fija por milla.",
+                message_en="Shipday is disabled. Using flat per-mile pricing only.",
+            ),
+        )
+
     # 1) Obtener orden desde tu backend
     body = None
     try:
@@ -771,7 +744,7 @@ async def shipday_availability(order_id: str):
             ),
         )
 
-    # 3.0) 👉 BLOQUEO por LISTA NEGRA (detección simple por cadena)
+    # 3.0) Bloqueo por lista negra (detección simple por cadena)
     reason_blk = _is_blacklisted_string(delivery_address)
     if reason_blk:
         ts_iso = datetime.now(timezone.utc).isoformat()
@@ -783,19 +756,18 @@ async def shipday_availability(order_id: str):
             shipday_requested_at_iso=ts_iso,
             error=CoverageError(
                 code="OUT_OF_COVERAGE_BLACKLIST",
-                message_es=f"Fuera de covertura, pronto abriremos aqui.",
-                message_en=f"Out of coverage, we will open here soon",
+                message_es="Fuera de cobertura, pronto abriremos aquí.",
+                message_en="Out of coverage, we will open here soon",
             ),
         )
 
-    # 3.1) 👉 Calcular distancia por conducción y aplicar límite
+    # 3.1) Distancia por conducción y límite para Shipday
     over_limit = False
     try:
         async with httpx.AsyncClient() as client:
             p_lat, p_lng, _ = await geocode_address(client, pickup_address)
             d_lat, d_lng, d_label = await geocode_address(client, delivery_address)
 
-            # Chequeo de lista negra con Address (etiqueta estricta) — más robusto
             reason_blk2 = _is_blacklisted_address(
                 Address(unit=None, street=d_label.split(",")[0], city=d_label.split(",")[1].strip().split(" ")[0],
                         state=d_label.split(",")[2].strip().split(" ")[0], zip=d_label.split(",")[2].strip().split(" ")[1],
@@ -812,19 +784,17 @@ async def shipday_availability(order_id: str):
                     shipday_requested_at_iso=ts_iso,
                     error=CoverageError(
                         code="OUT_OF_COVERAGE_BLACKLIST",
-                        message_es=f"Fuera de covertura, pronto abriremos aqui.",
-                        message_en=f"Out of coverage, we will open here soon",
+                        message_es="Fuera de cobertura, pronto abriremos aquí.",
+                        message_en="Out of coverage, we will open here soon",
                     ),
                 )
 
             driving_miles, _secs = await driving_distance_miles(client, p_lat, p_lng, d_lat, d_lng)
         over_limit = driving_miles > DRIVING_DISTANCE_MAX_MILES
     except Exception:
-        # Si no se puede calcular, no bloqueamos por límite
         over_limit = False
 
     if over_limit:
-        # Sobre el límite: NO usamos Shipday y NO devolvemos error
         return ShipdayAvailabilityResponse(
             available=False,
             availability=None,
@@ -834,18 +804,17 @@ async def shipday_availability(order_id: str):
             error=None,
         )
 
-    # 4) Consultar disponibilidad en Shipday con la API key elegida
+    # 4) Consultar Shipday (solo si está habilitado)
     async with httpx.AsyncClient() as client:
         best, payload, raw, ts = await shipday_quote_fee_by_address(
             client=client,
             pickup_address=pickup_address,
             delivery_address=delivery_address,
-            preferred_provider=SHIPDAY_PREFERRED_PROVIDER,   # 👉 DoorDash por defecto
-            secondary_provider=SHIPDAY_SECONDARY_PROVIDER,   # 👉 Uber como fallback
-            api_key=api_key,                                 # 👉 key US o CO según site
+            preferred_provider=SHIPDAY_PREFERRED_PROVIDER,
+            secondary_provider=SHIPDAY_SECONDARY_PROVIDER,
+            api_key=api_key,
         )
 
-    # Caso normal: si encontramos proveedor preferido o secundario
     if isinstance(best, ShipdayAvailability):
         return ShipdayAvailabilityResponse(
             available=True,
@@ -856,7 +825,6 @@ async def shipday_availability(order_id: str):
             error=None,
         )
 
-    # Sin disponibilidad
     return ShipdayAvailabilityResponse(
         available=False,
         availability=None,
@@ -870,12 +838,12 @@ async def shipday_availability(order_id: str):
         ),
     )
 
-# Versión por coordenadas (compat)
+# Versión por coordenadas (compat, se conserva)
 async def shipday_quote_fee(
     client: httpx.AsyncClient,
     pickup_lat: float, pickup_lng: float,
     drop_lat: float, drop_lng: float,
-    api_key: Optional[str] = None,  # 👈 se puede inyectar la key
+    api_key: Optional[str] = None,
 ) -> Optional[float]:
     headers = {
         "Authorization": _shipday_auth_value(api_key),
@@ -925,16 +893,11 @@ async def shipday_quote_fee(
     return min(fees) if fees else None
 
 # ─────────── Helpers Autocomplete ───────────
-
 async def _strict_label_from_place(
     client: httpx.AsyncClient,
     place_id: str,
     session_token: Optional[str]
 ) -> Optional[Tuple[Address, str]]:
-    """
-    Valida con Place Details y construye una etiqueta estricta (NUM STREET, CITY, ST ZIP, COUNTRY).
-    Devuelve (Address, label) solo si tiene número, ciudad, estado, zip y país.
-    """
     try:
         _lat, _lng, _formatted, comps = await places_details_with_components(
             client, place_id, session_token
@@ -1221,7 +1184,7 @@ async def coverage_details(
         strict_label = _address_to_str(address)
         dropoff = Dropoff(address=address)
 
-        # 👉 BLOQUEO por LISTA NEGRA (firme)
+        # Bloqueo por lista negra
         reason_blk = _is_blacklisted_address(address, strict_label)
         if reason_blk:
             near = nearest_site_for(dlat, dlng, radius_miles=coverage_radius_miles)
@@ -1244,12 +1207,12 @@ async def coverage_details(
                 shipday_requested_at_iso=None,
                 error=CoverageError(
                     code="OUT_OF_COVERAGE_BLACKLIST",
-                    message_es=f"Fuera de covertura, pronto abriremos aqui.",
-                    message_en=f"Out of coverage, we will open here soon",
+                    message_es="Fuera de cobertura, pronto abriremos aquí.",
+                    message_en="Out of coverage, we will open here soon",
                 ),
             )
 
-        # Elegimos la sede más cercana para origen (sin bloquear por ciudad ni por distancia)
+        # Sede más cercana
         near = nearest_site_for(dlat, dlng, radius_miles=coverage_radius_miles)
 
         # Distancia por conducción (con fallback a haversine si falla)
@@ -1272,16 +1235,20 @@ async def coverage_details(
         # Seleccionar API key según site (US vs CO)
         api_key_for_near = select_shipday_api_key_for_site(near.site.get("site_id"))
 
-        # 👉 Si excede el límite, NO consultamos Shipday y dejamos campos Shipday en null
-        over_limit = (near.driving_distance_miles is not None and near.driving_distance_miles > DRIVING_DISTANCE_MAX_MILES)
+        # Límite de distancia: solo relevante si Shipday está activo
+        over_limit = (
+            SHIPDAY_ENABLED and
+            (near.driving_distance_miles is not None) and
+            (near.driving_distance_miles > DRIVING_DISTANCE_MAX_MILES)
+        )
 
-        if over_limit:
+        # >>> Cambio: si Shipday está deshabilitado o se excede el límite, NO consultamos Shipday
+        if (not SHIPDAY_ENABLED) or over_limit or (not api_key_for_near):
             sd = None
             sd_payload = None
             sd_raw = None
             sd_ts = None
         else:
-            # 👇 obtenemos disponibilidad + payload + respuesta + timestamp (DoorDash -> Uber)
             sd, sd_payload, sd_raw, sd_ts = await shipday_quote_fee_by_address(
                 client,
                 pickup_address=pickup_addr_str,
@@ -1292,27 +1259,27 @@ async def coverage_details(
                 api_key=api_key_for_near,
             )
 
+        # >>> Cambio: precio final SIEMPRE puede calcularse por millas (es el único si SHIPDAY_ENABLED=False)
         pickup_duration_minutes: Optional[int] = None
         delivery_duration_minutes: Optional[int] = None
         pickup_time_iso: Optional[str] = None
         delivery_time_iso_out: Optional[str] = None
 
-        if isinstance(sd, ShipdayAvailability):
-            # Shipday en USD
+        if SHIPDAY_ENABLED and isinstance(sd, ShipdayAvailability):
+            # Si Shipday está activo y hubo disponibilidad, puedes usar el fee de Shipday
             cost_int = int(math.ceil(float(sd.fee)))
             pickup_duration_minutes = sd.pickup_duration_minutes
             delivery_duration_minutes = sd.delivery_duration_minutes
             pickup_time_iso = sd.pickup_time_iso
             delivery_time_iso_out = sd.delivery_time_iso
         else:
-            # Fallback manual SIEMPRE (incluye caso over_limit) con tarifa por milla
+            # Cotizador simple: USD por milla
             miles_for_cost = float(near.driving_distance_miles or d_miles or 0.0)
             base_cost = miles_for_cost * DELIVERY_RATE_USD_PER_MILE
             if not near.in_coverage:
                 base_cost = max(base_cost, DELIVERY_MIN_USD_OUT_OF_COVERAGE)
             cost_int = int(math.ceil(base_cost))
 
-        # 👉 SIN error cuando over_limit
         err_obj = None
 
     return CoverageDetailsResponse(
@@ -1328,9 +1295,9 @@ async def coverage_details(
         delivery_duration_minutes=delivery_duration_minutes,
         pickup_time_iso=pickup_time_iso,
         delivery_time_iso=delivery_time_iso_out,
-        shipday_payload=sd_payload if not over_limit else None,
-        shipday_response=sd_raw if not over_limit else None,
-        shipday_requested_at_iso=sd_ts if not over_limit else None,
+        shipday_payload=sd_payload if (SHIPDAY_ENABLED and not over_limit) else None,
+        shipday_response=sd_raw if (SHIPDAY_ENABLED and not over_limit) else None,
+        shipday_requested_at_iso=sd_ts if (SHIPDAY_ENABLED and not over_limit) else None,
         error=err_obj
     )
 
