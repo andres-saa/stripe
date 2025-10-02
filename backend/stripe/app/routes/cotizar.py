@@ -150,7 +150,7 @@ SEDES: List[Dict[str, Any]] = [
         "time_zone": "America/New_York",
         "restaurant_id": 1,
         "city_name": "USA",
-        "location": {"lat": 40.7556, "long": -73.8872},  # ejemplo aprox. de Jackson Heights
+        "location": {"lat": 40.7556, "long": -73.8821},  # ejemplo aprox. de Jackson Heights
         "pickup": {
             "address": {
                 "zip": "11372",
