@@ -80,6 +80,17 @@ def _as_int(val: Any) -> Optional[int]:
         return int(m.group(0)) if m else None
     return None
 
+
+class SimpleQuoteResponse(BaseModel):
+    ok: bool
+    message: Optional[str] = None
+    formatted_address: Optional[str] = None
+    site_id: Optional[int] = None
+    site_name: Optional[str] = None
+    delivery_cost_cop: Optional[int] = None
+    distance_km: Optional[float] = None  # distancia conducida si es posible; si no, Haversine
+
+
 def _provider_name(item: Dict[str, Any]) -> str:
     def _norm(s: Optional[str]) -> str:
         return (s or "").strip().lower()
@@ -1223,3 +1234,85 @@ async def shipday_distance_from_nearest_site(
         shipday_distance_miles_driving=round(dist_km / 1.609344, 3),   # millas conducidas derivadas
         error=None
     )
+
+
+
+@router.get("/quote/simple", response_model=SimpleQuoteResponse)
+async def simple_quote(
+    address: str = Query(..., min_length=5, description="Dirección completa o lo más detallada posible"),
+    city: str = Query(..., min_length=2, description="Ciudad (por ej. Bogotá, Cali, Medellín, Yumbo, Jamundí)"),
+    language: str = Query("es", description="Idioma para Distance Matrix")
+):
+    """
+    Endpoint simple:
+    - Recibe `address` y `city`.
+    - Selecciona la sede más cercana *dentro* de esa ciudad (según tu regla de cobertura).
+    - Calcula el valor del domicilio con tu tarifa por tramos.
+    - Si la dirección está incompleta o no se puede resolver bien, pide una dirección más detallada.
+    """
+    async with httpx.AsyncClient() as client:
+        # Asegurar sedes con coords y ciudades normalizadas
+        await ensure_sites_coords(client)
+
+        city_norm = normalize_city(city or "")
+        # Verificar que existan sedes en esa ciudad
+        has_sites_in_city = any((s.get("city_norm") == city_norm and s.get("location")) for s in SEDES)
+        if not city_norm or not has_sites_in_city:
+            return SimpleQuoteResponse(
+                ok=False,
+                message=f"No hay cobertura en {city}. Por favor selecciona una ciudad donde tengamos sedes.",
+            )
+
+        # Geocodificar la dirección libre y extraer componentes
+        try:
+            dlat, dlng, formatted, comps = await geocode_address_with_components(client, address, countries="co")
+        except HTTPException as e:
+            return SimpleQuoteResponse(
+                ok=False,
+                message="No pude ubicar esa dirección. Por favor envía una dirección más completa (calle/carrera y número, barrio y ciudad).",
+            )
+
+        # Construir address y validar si parece suficientemente específica
+        addr, raw_address = _build_address_from_components(comps)
+        street_ok = bool(addr.street and re.search(r"\d", addr.street))  # al menos algo con número
+        # Si Google resolvió otra ciudad, preferimos la ciudad que el usuario indicó para cobertura
+        # pero si ni siquiera detectamos ciudad de la dirección, pedimos más detalle
+        parsed_city_norm = normalize_city(addr.city)
+        city_ok = bool(parsed_city_norm)
+
+        if not street_ok or not city_ok:
+            return SimpleQuoteResponse(
+                ok=False,
+                formatted_address=formatted,
+                message="Necesito una dirección más completa (por ejemplo: 'Carrera 7 # 45-20, Barrio X').",
+            )
+
+        # Elegir sede más cercana ENTRE las sedes de la ciudad indicada por el usuario
+        near = nearest_among_same_city(dlat, dlng, city_norm)
+        if not near.in_coverage or not near.site:
+            return SimpleQuoteResponse(
+                ok=False,
+                formatted_address=formatted,
+                message=f"No hay cobertura en {city}. Aún no tenemos sedes en esa ciudad.",
+            )
+
+        # Calcular distancia de conducción si es posible (fallback: Haversine)
+        try:
+            slat = near.site["location"]["lat"]
+            slng = near.site["location"]["long"]
+            driving_km, _ = await driving_distance_km(client, slat, slng, dlat, dlng, language=language)
+            distance_km = round(driving_km, DISTANCE_REPORT_DECIMALS)
+        except Exception:
+            distance_km = round(near.distance_km, DISTANCE_REPORT_DECIMALS)
+
+        # Calcular costo según tus tramos
+        delivery_cost = compute_delivery_cost_cop(distance_km)
+
+        return SimpleQuoteResponse(
+            ok=True,
+            formatted_address=formatted,
+            site_id=int(near.site.get("site_id")),
+            site_name=str(near.site.get("site_name")),
+            delivery_cost_cop=int(delivery_cost),
+            distance_km=float(distance_km),
+        )
