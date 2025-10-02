@@ -464,6 +464,31 @@ def _components_for(countries: Optional[str] = None) -> Optional[str]:
         return None
     return "|".join(f"country:{c}" for c in norm)
 
+ZIP_TO_SITE: Dict[str, int] = {
+    # Queens - Jackson Heights / alrededores
+    "11369": 37, "11370": 37, "11371": 37,
+    "11372": 37, "11373": 37, "11374": 37,
+    "11375": 37, "11377": 37, "11378": 37,
+    "11101": 37, "11102": 37, "11103": 37, "11104": 37, "11105": 37, "11106": 37,
+    # Agrega más ZIPs de cobertura real que quieras forzar a NEW YORK
+    # Brooklyn, Bronx, etc. en caso de abrir esas áreas con esa sede
+    # "112xx": 37, ...
+}
+
+
+def assign_site_by_zip(zip_code: str) -> Optional[Dict[str, Any]]:
+    z = (zip_code or "").strip()
+    if not z:
+        return None
+    # Probar exacto (5 dígitos)
+    sid = ZIP_TO_SITE.get(z)
+    if sid is not None:
+        for s in SEDES:
+            if s.get("site_id") == sid:
+                return s
+    return None
+
+
 async def geocode_address(client: httpx.AsyncClient, address: str) -> Tuple[float, float, str]:
     """
     Geocodifica y devuelve SIEMPRE una etiqueta estricta: '123 Main St, City, ST 99999, US'.
@@ -1327,6 +1352,18 @@ async def coverage_details(
                     message_en=f"Out of coverage, we will open here soon",
                 ),
             )
+
+
+
+        forced_site = assign_site_by_zip(address.zip)
+        if forced_site:
+            near = NearestInfo(site=forced_site, distance_miles=round(
+                haversine_miles(forced_site["location"]["lat"], forced_site["location"]["long"], dlat, dlng), 2
+            ), in_coverage=True)
+        else:
+            # 2) Fallback a "nearest" geométrico
+            near = nearest_site_for(dlat, dlng, radius_miles=coverage_radius_miles)
+
 
         # Elegimos la sede más cercana para origen (sin bloquear por ciudad ni por distancia)
         near = nearest_site_for(dlat, dlng, radius_miles=coverage_radius_miles)
