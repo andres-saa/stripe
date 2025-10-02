@@ -22,6 +22,13 @@ app.include_router(cotizar.router)
 app.include_router(cotizar_colombia.router)
 
 
-@app.get("/")
-def root():
+# @app.get("/")
+# def root(data):
+#     print(data)
+#     return {"ok": True}
+
+
+@app.post("/webhook")
+def root(data:dict):
+    print(data)
     return {"ok": True}

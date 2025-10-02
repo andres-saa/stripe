@@ -74,6 +74,7 @@ NEWARK_MIN_USD            = float(os.getenv("NEWARK_MIN_USD", "13.0"))
 router = APIRouter()
 
 # ─────────── SEDES (USA) ───────────
+
 SEDES: List[Dict[str, Any]] = [
     {
         "site_id": 33,
@@ -126,7 +127,43 @@ SEDES: List[Dict[str, Any]] = [
             }
         },
     },
+    {
+        "site_id": 37,
+        "site_name": "NEW YORK",
+        "site_address": "84-19 Northern Blvd L1, Jackson Heights, NY 11372",
+        "site_phone": "+13477929350",
+        "site_business_hours": "string",
+        "horario_semanal": {
+            "dia": "string"
+        },
+        "wsp_link": "https://wa.link/6v0usl",
+        "city_id": 15,
+        "maps": "https://share.google/xpM5tbzW3CZCtvLK9",
+        "show_on_web": True,
+        "email_address": "Hola@gmail.com",
+        "status": True,
+        "comming_soon": False,
+        "open": True,
+        "pe_site_id": 16,
+        "exist": True,
+        "invoice_identifier": "NEK",
+        "time_zone": "America/New_York",
+        "restaurant_id": 1,
+        "city_name": "USA",
+        "location": {"lat": None, "long": None},  # si luego quieres agregar coordenadas
+        "pickup": {
+            "address": {
+                "zip": "11372",
+                "city": "Jackson Heights",
+                "unit": None,
+                "state": "NY",
+                "street": "84-19 Northern Blvd L1",
+                "country": "US",
+            }
+        },
+    },
 ]
+
 
 # ─────────── Modelos ───────────
 
@@ -219,13 +256,13 @@ Cada regla puede usar:
 - contains: lista de fragmentos (minúsculas) a buscar en la etiqueta formateada (e.g. "new york, ny")
 """
 BLACKLIST_LOCATIONS: List[Dict[str, Any]] = [
-    {
-        "name": "New York City (todos los boroughs)",
-        "state": "NY",
-        "city_in": ["New York", "Manhattan", "Brooklyn", "Queens", "Bronx", "Staten Island"],
-        "zip_prefixes": [],
-        "contains": ["new york, ny", "brooklyn, ny", "queens, ny", "bronx, ny", "staten island, ny", "manhattan, ny"],
-    }
+    # {
+    #     "name": "New York City (todos los boroughs)",
+    #     "state": "NY",
+    #     "city_in": ["New York", "Manhattan", "Brooklyn", "Queens", "Bronx", "Staten Island"],
+    #     "zip_prefixes": [],
+    #     "contains": ["new york, ny", "brooklyn, ny", "queens, ny", "bronx, ny", "staten island, ny", "manhattan, ny"],
+    # }
 ]
 
 def _cf(s: Optional[str]) -> str:
