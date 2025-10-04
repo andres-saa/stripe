@@ -8,7 +8,6 @@ import httpx
 from dotenv import load_dotenv
 import re
 from datetime import datetime, timezone
-import requests
 
 load_dotenv()
 
@@ -34,7 +33,6 @@ SHIPDAY_API_KEY_COLOMBIA = (
 
 # NO consultar Shipday
 SHIPDAY_ENABLED = False
-
 SHIPDAY_AVAILABILITY_URL = "https://api.shipday.com/on-demand/availability"
 
 # Fallback manual (USD por milla)
@@ -56,7 +54,7 @@ SHIPDAY_SECONDARY_PROVIDER = (os.getenv("SHIPDAY_SECONDARY_PROVIDER", "uber")).s
 # Sitios que cuentan como NEWARK para mínimo 13 USD
 NEWARK_SITE_IDS = {36}
 
-# Mínimos cotizador manual
+# Mínimos cotizador manual (globales)
 DELIVERY_MIN_USD_FALLBACK = float(os.getenv("DELIVERY_MIN_USD_FALLBACK", "6.0"))
 NEWARK_MIN_USD            = float(os.getenv("NEWARK_MIN_USD", "13.0"))
 
@@ -383,6 +381,31 @@ def assign_site_by_zip(zip_code: str) -> Optional[Dict[str, Any]]:
                 return s
     return None
 
+# ─────────── NUEVO: selección por ciudad/estado con prioridad ───────────
+def assign_site_by_city_state(city: str, state: str) -> Optional[Dict[str, Any]]:
+    """
+    Regla pedida: la ciudad tiene prioridad sobre la distancia.
+    - Match EXACTO city/state contra pickup.address de las sedes.
+    - Caso especial: si state == 'NY', forzamos la sede NEW YORK (site_id 37),
+      pues 'city' puede venir como Jackson Heights/Queens/etc.
+    """
+    city_cf = _cf(city)
+    state_cf = _cf(state)
+
+    # Caso general: emparejo city/state exacto contra pickup.address
+    for s in SEDES:
+        addr = (s.get("pickup") or {}).get("address") or {}
+        if _cf(addr.get("city")) == city_cf and _cf(addr.get("state")) == state_cf:
+            return s
+
+    # Caso especial para NY: cualquier ciudad del estado NY debe salir desde NEW YORK
+    if state_cf == "ny":
+        for s in SEDES:
+            if s.get("site_id") == 37 or _cf(s.get("site_name")) == "new york":
+                return s
+
+    return None
+
 # Geocoding simple (sin validaciones estrictas)
 async def geocode_address(client: httpx.AsyncClient, address: str) -> Tuple[float, float, str]:
     if not GOOGLE_API_KEY:
@@ -499,10 +522,30 @@ def _is_newark_site(site: Optional[Dict[str, Any]]) -> bool:
     sid = site.get("site_id")
     return name == "newark" or sid in NEWARK_SITE_IDS
 
+def _is_newyork_site(site: Optional[Dict[str, Any]]) -> bool:
+    if not site:
+        return False
+    name = (site.get("site_name") or "").strip().lower()
+    sid = site.get("site_id")
+    return name == "new york" or sid == 37
+
+def get_rate_and_min_for_site(site: Optional[Dict[str, Any]]) -> Tuple[float, float]:
+    """
+    - NEW YORK: 6 USD/milla, mínimo 6 USD
+    - NEWARK: mantener mínimo especial (NEWARK_MIN_USD); tarifa por milla usa el global
+    - Resto: usar globals DELIVERY_RATE_USD_PER_MILE y DELIVERY_MIN_USD_FALLBACK
+    """
+    if _is_newyork_site(site):
+        return 6.0, 6.0
+    if _is_newark_site(site):
+        # Tarifa por milla: global; mínimo: NEWARK_MIN_USD
+        return DELIVERY_RATE_USD_PER_MILE, max(NEWARK_MIN_USD, DELIVERY_MIN_USD_FALLBACK)
+    # Default
+    return DELIVERY_RATE_USD_PER_MILE, DELIVERY_MIN_USD_FALLBACK
+
 def manual_quote_usd(miles: float, pickup_site: Optional[Dict[str, Any]]) -> int:
-    base = max(float(miles) * DELIVERY_RATE_USD_PER_MILE, DELIVERY_MIN_USD_FALLBACK)
-    if _is_newark_site(pickup_site) and base < NEWARK_MIN_USD:
-        base = NEWARK_MIN_USD
+    rate_per_mile, min_usd = get_rate_and_min_for_site(pickup_site)
+    base = max(float(miles) * rate_per_mile, min_usd)
     return int(math.ceil(base))
 
 # ─────────── Endpoints ───────────
@@ -599,7 +642,8 @@ async def coverage_details(
     - Usa Place Details UNA sola vez (para lat/lng + address_components).
     - NO valida que la dirección tenga número/zip/país (evita rechazos).
     - NO consulta Shipday; siempre usa cotizador manual.
-    - Respeta ZIP_TO_SITE (fuerza sede), y ya NO se sobreescribe luego.
+    - PRIORIDAD: ciudad/estado > ZIP_TO_SITE > nearest.
+    - NEW YORK: 6 USD/milla con mínimo 6 USD.
     """
     async with httpx.AsyncClient() as client:
         dlat, dlng, formatted, comps = await places_details_with_components(client, place_id, session_token)
@@ -627,7 +671,7 @@ async def coverage_details(
 
         address = Address(
             unit=unit or None,
-            street=street or formatted.split(",")[0],
+            street=street or (formatted.split(",")[0] if "," in formatted else formatted),
             city=city or (formatted.split(",")[1].strip() if "," in formatted else ""),
             state=state,
             zip=zip_code,
@@ -665,16 +709,21 @@ async def coverage_details(
                 ),
             )
 
-        # 1) Intentar forzar sede por ZIP
-        forced_site = assign_site_by_zip(address.zip)
+        # ─── Prioridad 1) Forzar sede por ciudad/estado
+        forced_by_city = assign_site_by_city_state(address.city, address.state)
 
-        if forced_site:
-            # Distancia haversine al forzado
-            forced_dist = haversine_miles(forced_site["location"]["lat"], forced_site["location"]["long"], dlat, dlng)
-            near = NearestInfo(site=forced_site, distance_miles=round(forced_dist, 2), in_coverage=True)
+        if forced_by_city:
+            forced_dist = haversine_miles(forced_by_city["location"]["lat"], forced_by_city["location"]["long"], dlat, dlng)
+            near = NearestInfo(site=forced_by_city, distance_miles=round(forced_dist, 2), in_coverage=True)
         else:
-            # 2) Fallback a "nearest" geométrico si no hay ZIP forzado
-            near = nearest_site_for(dlat, dlng, radius_miles=coverage_radius_miles)
+            # ─── Prioridad 2) Intentar por ZIP
+            forced_site = assign_site_by_zip(address.zip)
+            if forced_site:
+                forced_dist = haversine_miles(forced_site["location"]["lat"], forced_site["location"]["long"], dlat, dlng)
+                near = NearestInfo(site=forced_site, distance_miles=round(forced_dist, 2), in_coverage=True)
+            else:
+                # ─── Prioridad 3) Nearest geométrico
+                near = nearest_site_for(dlat, dlng, radius_miles=coverage_radius_miles)
 
         # Distancia por conducción (con fallback a haversine si falla)
         s = near.site["location"]
